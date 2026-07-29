@@ -1,0 +1,7 @@
+# Jetson (JetPack 6.x) 기준.
+# 주의: torch/torchvision은 pip 기본 wheel이 아니라 NVIDIA Jetson용 wheel을 설치할 것
+#   https://docs.ultralytics.com/guides/nvidia-jetson/ 참고
+ultralytics>=8.4
+opencv-python>=4.8        # JetPack 기본 OpenCV 사용 시 생략 가능
+lap>=0.5.12               # ByteTrack 의존성
+numpy
