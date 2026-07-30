@@ -1,0 +1,17 @@
+# TensorRT 엔진 — 빌드한 GPU/JetPack 전용이므로 보드에서 생성
+models/*.engine
+
+# TTS 모델 가중치 (setup_tts.sh가 HuggingFace에서 내려받음, 수백 MB)
+models/tts/
+
+# 사전 렌더링된 방송 wav (prerender_tts.py가 생성, ~100MB)
+cache/
+
+# TTS 전용 venv
+.venv-tts/
+
+# 실행 산출물
+output/
+
+__pycache__/
+*.pyc

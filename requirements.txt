@@ -5,3 +5,9 @@ ultralytics>=8.4
 opencv-python>=4.8        # JetPack 기본 OpenCV 사용 시 생략 가능
 lap>=0.5.12               # ByteTrack 의존성
 numpy
+
+# --- TTS 방송(--tts) 의존성은 여기에 넣지 말 것 ---
+# onnxruntime이 numpy 2.x를 끌어오는데 JetPack 기본 cv2는 numpy 1.x로 빌드되어 있어
+# 같은 환경에 섞으면 cv2가 깨진다. TTS 의존성(supertonic / onnxruntime / soundfile /
+# huggingface-hub)은 setup_tts.sh가 격리된 .venv-tts/ 에 설치한다.
+# 감시 프로세스는 사전 렌더링된 wav를 paplay로 재생할 뿐이라 추가 런타임 의존성이 없다.

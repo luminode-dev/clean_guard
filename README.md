@@ -11,9 +11,15 @@ jetson_deploy/
 │   ├── waste10_yolo26n.onnx    #   └ 이식용 ONNX (opset17, 640, NMS 포함 e2e)
 │   ├── person_yolo26n.pt       # 사람 탐지 (COCO 사전학습)
 │   ├── person_yolo26n.onnx
-│   └── *.engine                # ← Jetson 위에서 convert_tensorrt.sh 로 생성
+│   ├── *.engine                # ← Jetson 위에서 convert_tensorrt.sh 로 생성
+│   └── tts/supertonic-2/       # ← setup_tts.sh 가 내려받는 TTS 모델 (약 256MB)
 ├── dump_monitor_jetson.py      # 실행 모듈 (RTSP/웹캠/파일 입력)
 ├── convert_tensorrt.sh         # TensorRT 변환 (Jetson에서 실행)
+├── tts/                        # 음성 경고 방송 모듈 (아래 "음성 경고 방송" 참고)
+├── setup_tts.sh                # TTS 환경 셋업 (venv + 모델 다운로드)
+├── prerender_tts.py            # 방송 문구 사전 렌더링 CLI
+├── cache/tts/                  # ← 사전 렌더링된 방송 wav 120개 (약 90MB)
+├── tests/
 ├── requirements.txt
 └── README.md
 ```
@@ -29,7 +35,7 @@ jetson_deploy/
 pip3 install -r requirements.txt
 ```
 
-## TensorRT 변환 — 반드시 Jetson 위에서
+## TensorRT 변환 — Jetson Orin Nano에서 실행
 
 `.engine` 파일은 빌드한 GPU 전용이므로 PC에서 만들 수 없다. 보드에서 1회 실행:
 
@@ -38,8 +44,21 @@ chmod +x convert_tensorrt.sh
 ./convert_tensorrt.sh          # FP16, 모델당 수 분 소요
 ```
 
-실패 시 스크립트 안의 `trtexec` 경로(방법 2) 주석을 해제해 ONNX에서 직접 빌드.
-INT8이 필요하면 `half=True`를 `int8=True`로 바꾸고 캘리브레이션 데이터를 지정할 것 (정확도 검증 필수).
+스크립트는 먼저 Ultralytics의 `.pt` export를 시도하고, 실패하면 JetPack에 포함된
+`/usr/src/tensorrt/bin/trtexec`로 `.onnx`를 빌드한다. 두 모델 모두 입력 크기 640,
+배치 1, FP16으로 생성하며 기본 workspace는 2048 MiB다.
+
+환경에 따라 다음 값을 조정할 수 있다:
+
+```bash
+IMG_SIZE=640 TRT_WORKSPACE_MB=2048 ./convert_tensorrt.sh
+# trtexec 위치가 다른 경우
+TRTEXEC=/usr/local/bin/trtexec ./convert_tensorrt.sh
+```
+
+변환이 끝나면 `models/*.engine` 파일 크기를 검사한다. 실제 엔진 생성은 대상 Orin
+Nano에서 해야 하며, JetPack/TensorRT 버전이나 GPU가 바뀌면 다시 빌드해야 한다.
+INT8은 캘리브레이션 데이터와 정확도 검증을 준비한 뒤 별도 작업으로 적용한다.
 
 ## 실행
 
@@ -64,9 +83,73 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video
 특정 포맷을 강제하려면 `--waste-model models/waste10_yolo26n.pt` 처럼 확장자까지 지정한다.
 
 ### 출력 (`output/<name>/`)
-- `events.jsonl` — 이벤트 로그 (시각, 클래스, conf, 객체 id, 투기자 pid, bbox). append 방식이라 재시작해도 이어짐
+- `events.jsonl` — 이벤트 로그 (시각, 클래스, **색상**, conf, 객체 id, 투기자 pid, bbox). append 방식이라 재시작해도 이어짐
 - `event_NNNN.jpg` — 이벤트 증거 스냅샷 (빨간 박스 + 투기자 pid)
 - `annotated.mp4` — 전체 주석 영상 (`--no-save-video`로 생략 가능)
+
+## 음성 경고 방송 (`--tts`)
+
+투기 발화 시 **"[색상] [쓰레기 종류]를 무단으로 버리셨습니다. 되가져가 주시기 바랍니다.
+이곳은 CCTV 녹화 중입니다."** 를 현장 스피커로 방송한다. 클라우드 없이
+[Supertonic](https://huggingface.co/Supertone/supertonic-2) ONNX 모델로 온디바이스 합성한다.
+
+### 설계 원칙
+
+- **사전 렌더링**: (색상 11 + 색상없음) × 쓰레기 10종 = **120개 문장을 미리 wav로 합성**해
+  `cache/tts/`에 둔다. 이벤트 시점에는 파일 재생만 하므로 지연 0, 추론 자원 경합 없음
+- **의존성 격리**: onnxruntime은 numpy 2.x를 요구하고 JetPack 기본 cv2는 numpy 1.x 빌드라
+  섞이면 cv2가 깨진다. TTS 의존성은 전부 `.venv-tts/`에 격리하고, 합성은 항상 그 venv의
+  서브프로세스([tts/synth_worker.py](tts/synth_worker.py))에서 실행한다.
+  **감시 프로세스에는 추가 런타임 의존성이 없다**
+- **장애 격리**: 모델·스피커·캐시에 무슨 문제가 생겨도 `[TTS 경고]`만 남기고 감시는 계속된다
+
+### 셋업 (보드에서 1회)
+
+```bash
+bash setup_tts.sh          # venv + pip 부트스트랩 + supertonic-2 다운로드 + 스모크 테스트
+# 방송 문구 120개 사전 렌더링 (약 20분, ~90MB). 모델 폴더는 models/tts/ 에서 자동 인식
+.venv-tts/bin/python prerender_tts.py --all
+```
+
+디스크 여유가 600MB 이상 필요하다. 목소리를 바꾸려면 `ST_VOICE=F2 bash setup_tts.sh`
+(M1~M5 / F1~F5). 더 고품질이 필요하면 `ST_MODEL=supertonic-3` (약 400MB, 31개 언어).
+
+### 실행
+
+```bash
+python3 dump_monitor_jetson.py --source 0 --name cam01 --tts
+
+# 장소명을 방송에 포함 (그 장소 전용 캐시를 먼저 만들어야 함)
+.venv-tts/bin/python prerender_tts.py --all --location "정문 수거함 앞"
+python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-location "정문 수거함 앞"
+```
+
+| 플래그 | 기본 | 의미 |
+|---|---|---|
+| `--tts` | off | 방송 활성화 |
+| `--tts-cooldown` | 12.0 | 방송 간 최소 간격(초). 문장이 약 9초라 이보다 짧게 두면 대기열이 쌓인다 |
+| `--tts-repeat-window` | 30.0 | 같은 (색상, 종류) 조합 재방송 억제 시간(초) |
+| `--tts-location` | 없음 | 방송에 넣을 장소명 |
+| `--tts-cache` | `cache/tts` | 방송 wav 캐시 폴더 |
+| `--tts-no-runtime-synth` | off | 캐시 미스 시 실시간 합성 대신 방송 생략 (자원 보호) |
+| `--tts-backend` | `supertonic` | `null`로 두면 무음 wav — 배선 점검용 |
+| `--tts-model` / `--tts-voice` | `supertonic-2` / `M4` | 캐시 미스 합성용. 사전 렌더링과 같은 값이어야 목소리가 일관됨 |
+
+### 색상 판정
+
+`tts/color_naming.py`가 HSV 규칙으로 11색(빨간/주황/노란/초록/파란/보라/분홍/갈/흰/회/검은색)을
+판정한다. 신규 의존성 없음. 배경 오염을 줄이기 위해 박스 안쪽 70%만 사용하고,
+**이벤트 프레임 1장이 아니라 그 객체를 가장 확신했던 프레임의 크롭**(`WasteObject.best_crop`)에서
+색을 뽑는다. 유채색 픽셀이 30% 미만이면 무채색(검정 봉투, 흰 스티로폼 등)으로 판정한다.
+
+### 검증
+
+```bash
+python3 tests/test_color_naming.py      # 색상 판정 (모델 불필요)
+python3 tests/test_tts_offline.py       # 문구/캐시/재생큐/쿨다운 (모델·스피커 불필요)
+python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 발화→색상→방송 전 경로 (ultralytics 불필요)
+.venv-tts/bin/python prerender_tts.py --check   # 실제 합성 + 스피커 재생
+```
 
 ## 이벤트 로직 요약
 

@@ -1,26 +1,68 @@
 #!/usr/bin/env bash
-# TensorRT 엔진 변환 — 반드시 Jetson 보드 위에서 실행할 것.
-# (.engine은 빌드한 GPU 아키텍처 전용이라 PC에서 만든 것은 Jetson에서 동작하지 않음)
-set -e
-cd "$(dirname "$0")"
+# Build Jetson Orin Nano-specific TensorRT FP16 engines.
+set -Eeuo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
-echo "== TensorRT 변환 시작 (수 분 소요, FP16) =="
+readonly IMG_SIZE="${IMG_SIZE:-640}"
+readonly TRT_WORKSPACE_MB="${TRT_WORKSPACE_MB:-2048}"
+readonly TRTEXEC="${TRTEXEC:-/usr/src/tensorrt/bin/trtexec}"
+readonly MODELS=(waste10_yolo26n person_yolo26n)
 
-# 방법 1) ultralytics 내장 export (권장) — .pt에서 직접 변환
-python3 - <<'EOF'
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+[[ "${IMG_SIZE}" =~ ^[0-9]+$ ]] || die "IMG_SIZE must be an integer"
+[[ "${TRT_WORKSPACE_MB}" =~ ^[0-9]+$ ]] || die "TRT_WORKSPACE_MB must be an integer"
+command -v python3 >/dev/null || die "python3 is required"
+[[ -d models ]] || die "models directory not found"
+
+echo "== TensorRT FP16 conversion (Jetson Orin Nano) =="
+echo "image=${IMG_SIZE} batch=1 workspace=${TRT_WORKSPACE_MB}MiB"
+
+build_with_ultralytics() {
+  python3 - <<'PY'
+from pathlib import Path
+import shutil
 from ultralytics import YOLO
-for stem in ["waste10_yolo26n", "person_yolo26n"]:
-    m = YOLO(f"models/{stem}.pt")
-    path = m.export(format="engine", imgsz=640, half=True, device=0)
-    import shutil
-    shutil.move(path, f"models/{stem}.engine")
-    print(f"OK: models/{stem}.engine")
-EOF
 
-# 방법 2) ultralytics 실패 시 trtexec로 ONNX에서 직접 빌드 (주석 해제)
-# /usr/src/tensorrt/bin/trtexec --onnx=models/waste10_yolo26n.onnx \
-#     --saveEngine=models/waste10_yolo26n.engine --fp16 --memPoolSize=workspace:2048
-# /usr/src/tensorrt/bin/trtexec --onnx=models/person_yolo26n.onnx \
-#     --saveEngine=models/person_yolo26n.engine --fp16 --memPoolSize=workspace:2048
+img_size = int(__import__("os").environ["IMG_SIZE"])
+for stem in ("waste10_yolo26n", "person_yolo26n"):
+    target = Path("models") / f"{stem}.engine"
+    exported = YOLO(f"models/{stem}.pt").export(
+        format="engine", imgsz=img_size, batch=1, half=True, device=0,
+        verbose=False,
+    )
+    exported = Path(str(exported))
+    if exported.resolve() != target.resolve():
+        shutil.copy2(exported, target)
+    if not target.is_file() or target.stat().st_size == 0:
+        raise RuntimeError(f"empty engine: {target}")
+    print(f"OK: {target}")
+PY
+}
 
-echo "== 완료. dump_monitor_jetson.py 가 .engine 을 자동으로 사용합니다 =="
+build_with_trtexec() {
+  [[ -x "${TRTEXEC}" ]] || die "trtexec not found at ${TRTEXEC}; set TRTEXEC to its path"
+  for stem in "${MODELS[@]}"; do
+    local onnx="models/${stem}.onnx"
+    local engine="models/${stem}.engine"
+    [[ -s "${onnx}" ]] || die "missing ONNX model: ${onnx}"
+    "${TRTEXEC}" --onnx="${onnx}" --saveEngine="${engine}" \
+      --fp16 --memPoolSize="workspace:${TRT_WORKSPACE_MB}" \
+      --verbose
+    [[ -s "${engine}" ]] || die "trtexec produced no engine: ${engine}"
+    echo "OK: ${engine}"
+  done
+}
+
+export IMG_SIZE TRT_WORKSPACE_MB
+if build_with_ultralytics; then
+  :
+else
+  echo "Ultralytics export failed; falling back to trtexec ONNX build." >&2
+  build_with_trtexec
+fi
+
+for stem in "${MODELS[@]}"; do
+  test -s "models/${stem}.engine" || die "engine verification failed: models/${stem}.engine"
+done
+echo "== Complete: both FP16 engines are ready =="

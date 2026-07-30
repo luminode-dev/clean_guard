@@ -5,11 +5,13 @@
 - 모델은 models/ 폴더에서 .engine(TensorRT) > .onnx > .pt 순으로 자동 선택
 - 로직: 소지품-사람 귀속, LOST 객체 재식별(Re-ID), owner 이탈 시 발화
   (개발 PC의 work/scripts/dump_monitor.py v2와 동일 로직)
+- --tts: 발화 시 '색상 + 쓰레기 종류'를 특정한 한국어 경고를 스피커로 방송 (tts/ 참고)
 
 usage:
   python3 dump_monitor_jetson.py --source rtsp://... --name cam01
   python3 dump_monitor_jetson.py --source 0 --name webcam --show
   python3 dump_monitor_jetson.py --source clip.mp4 --name test --no-save-video
+  python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-location "정문 수거함 앞"
 """
 import argparse
 import json
@@ -20,6 +22,15 @@ from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+try:                                          # TTS는 선택 기능 — 없어도 감시는 동작
+    from tts import Announcer, dominant_color_name
+    from tts.color_naming import crop_box
+except Exception as _tts_err:                 # noqa: BLE001
+    Announcer = dominant_color_name = crop_box = None
+    _TTS_IMPORT_ERROR = _tts_err
+else:
+    _TTS_IMPORT_ERROR = None
 
 HERE = Path(__file__).parent
 
@@ -136,10 +147,20 @@ def person_near(obj_box, person_boxes, factor=NEAR_FACTOR):
     return False
 
 
+def best_color_crop(frame, box):
+    """색상 판정용 64x64 크롭 사본. TTS 모듈이 없으면 None."""
+    if crop_box is None:
+        return None
+    c = crop_box(frame, box)
+    if c is None or c.size == 0:
+        return None
+    return cv2.resize(c, (64, 64), interpolation=cv2.INTER_AREA)
+
+
 class WasteObject:
     _next_id = 1
 
-    def __init__(self, box, cls, conf, frame_idx, hist):
+    def __init__(self, box, cls, conf, frame_idx, hist, frame=None):
         self.id = WasteObject._next_id
         WasteObject._next_id += 1
         self.box = box
@@ -155,8 +176,20 @@ class WasteObject:
         self.owner_strong = False
         self.fired = False
         self.clear_count = 0
+        # 방송 색상은 '가장 확신했던 프레임'의 크롭에서 뽑는다 (발화 프레임 1장보다 안정적)
+        self.best_conf = -1.0
+        self.best_crop = None
+        self._update_crop(frame, box, conf)
 
-    def seen(self, box, conf, frame_idx, hist):
+    def _update_crop(self, frame, box, conf):
+        if frame is None or conf <= self.best_conf:
+            return
+        c = best_color_crop(frame, box)
+        if c is not None:
+            self.best_conf, self.best_crop = conf, c
+
+    def seen(self, box, conf, frame_idx, hist, frame=None):
+        self._update_crop(frame, box, conf)
         self.box, self.conf, self.last_seen = box, conf, frame_idx
         self.age += 1
         if hist is not None:
@@ -172,10 +205,39 @@ def main():
     ap.add_argument("--person-model", default=None)
     ap.add_argument("--show", action="store_true", help="화면 표시 (모니터 연결 시)")
     ap.add_argument("--no-save-video", action="store_true", help="주석 영상 저장 생략")
+    ap.add_argument("--tts", action="store_true", help="이벤트 발생 시 음성 경고 방송")
+    ap.add_argument("--tts-backend", default="supertonic", choices=["supertonic", "null"],
+                    help="캐시 미스 시 사용할 합성 백엔드 (null=무음, 점검용)")
+    ap.add_argument("--tts-cache", default=None, help="방송 wav 캐시 폴더 (기본 cache/tts)")
+    ap.add_argument("--tts-location", default=None,
+                    help="방송에 넣을 장소명. 지정 시 그 장소 전용 캐시를 따로 만들어야 함")
+    ap.add_argument("--tts-cooldown", type=float, default=12.0,
+                    help="방송 간 최소 간격(초). 문장 길이(약 9초)보다 크게 두어 대기열 적체를 막는다")
+    ap.add_argument("--tts-repeat-window", type=float, default=30.0,
+                    help="같은 (색상,종류) 조합 재방송 억제 시간(초)")
+    ap.add_argument("--tts-no-runtime-synth", action="store_true",
+                    help="캐시 미스 시 실시간 합성을 하지 않고 방송을 건너뜀")
+    ap.add_argument("--tts-model", default="supertonic-2",
+                    help="캐시 미스 합성에 쓸 모델. 사전 렌더링과 같은 값이어야 함")
+    ap.add_argument("--tts-voice", default="M4",
+                    help="캐시 미스 합성에 쓸 목소리(M1~M5/F1~F5). 사전 렌더링과 같은 값이어야 함")
     args = ap.parse_args()
 
     out_dir = Path(args.out) / args.name
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    announcer = None
+    if args.tts:
+        if Announcer is None:
+            print(f"[TTS 경고] tts 모듈 로드 실패 ({_TTS_IMPORT_ERROR}) -> 방송 없이 계속")
+        else:
+            tts_kw = ({} if args.tts_backend == "null"
+                      else {"model": args.tts_model, "voice": args.tts_voice})
+            announcer = Announcer(
+                cache_dir=args.tts_cache, backend=args.tts_backend,
+                location=args.tts_location, cooldown=args.tts_cooldown,
+                repeat_window=args.tts_repeat_window,
+                allow_runtime_synth=not args.tts_no_runtime_synth, **tts_kw)
     waste_model, waste_path = load_model(args.waste_model or "waste10_yolo26n")
     person_model, person_path = load_model(args.person_model or "person_yolo26n")
     print(f"waste={Path(waste_path).name} person={Path(person_path).name} -> {out_dir}")
@@ -256,7 +318,7 @@ def main():
                 if v > best_iou:
                     best, best_iou = o, v
             if best is not None:
-                best.seen(box, conf, frame_idx, h)
+                best.seen(box, conf, frame_idx, h, frame=frame)
                 matched.add(best.id)
                 continue
             best, best_score = None, 0.0
@@ -271,10 +333,10 @@ def main():
                 if s >= REID_HIST_MIN and s > best_score:
                     best, best_score = o, s
             if best is not None:
-                best.seen(box, conf, frame_idx, h)
+                best.seen(box, conf, frame_idx, h, frame=frame)
                 matched.add(best.id)
                 continue
-            o = WasteObject(box, cls, conf, frame_idx, h)
+            o = WasteObject(box, cls, conf, frame_idx, h, frame=frame)
             best_pid, best_s = None, 0.0
             for pid, info in carried.items():
                 if frame_idx - info["last_frame"] > CARRY_WINDOW:
@@ -324,16 +386,24 @@ def main():
                 continue
             o.fired = True
             n_events += 1
+            color = None
+            if dominant_color_name is not None:
+                # best_crop(최고 확신 프레임)이 있으면 그것으로, 없으면 현재 프레임에서
+                color = (dominant_color_name(o.best_crop) if o.best_crop is not None
+                         else dominant_color_name(frame, o.box))
             ev = {"event": n_events, "frame": frame_idx, "sec": round(frame_idx / fps, 1),
                   "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                  "class": WASTE_NAMES[o.cls], "conf": round(o.conf, 2),
+                  "class": WASTE_NAMES[o.cls], "color": color, "conf": round(o.conf, 2),
                   "obj_id": o.id, "owner_pid": o.owner_pid,
                   "owner_matched": o.owner_strong, "box": [round(v) for v in o.box]}
             events_f.write(json.dumps(ev, ensure_ascii=False) + "\n")
             events_f.flush()
-            print(f"[이벤트 {n_events}] {ev['ts']} 무단투기 의심: {ev['class']} "
+            print(f"[이벤트 {n_events}] {ev['ts']} 무단투기 의심: "
+                  f"{color + ' ' if color else ''}{ev['class']} "
                   f"obj#{o.id} 투기자 pid={o.owner_pid}"
                   f"{'(소지품 매칭)' if o.owner_strong else ''}", flush=True)
+            if announcer is not None:
+                announcer.announce(color, WASTE_NAMES[o.cls])
             snap = frame.copy()
             x1, y1, x2, y2 = map(int, o.box)
             cv2.rectangle(snap, (x1, y1), (x2, y2), (0, 0, 255), 3)
@@ -369,13 +439,15 @@ def main():
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
+    dt = time.time() - t0          # 방송 잔여 재생 대기 전에 측정 (FPS 왜곡 방지)
     cap.release()
     if writer is not None:
         writer.release()
     events_f.close()
-    dt = time.time() - t0
     print(f"완료: {frame_idx}프레임, {dt:.1f}s ({frame_idx / max(dt, 0.1):.1f} FPS), "
           f"이벤트 {n_events}건 -> {out_dir}")
+    if announcer is not None:
+        announcer.close()          # 큐에 남은 방송을 끝까지 재생한 뒤 종료
 
 
 if __name__ == "__main__":
