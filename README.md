@@ -12,8 +12,10 @@ jetson_deploy/
 │   ├── person_yolo26n.pt       # 사람 탐지 (COCO 사전학습)
 │   ├── person_yolo26n.onnx
 │   ├── *.engine                # ← Jetson 위에서 convert_tensorrt.sh 로 생성
+│   ├── face_detection_yunet_2023mar.onnx  # 안면 모자이크용 YuNet (230KB, --mosaic face)
 │   └── tts/supertonic-2/       # ← setup_tts.sh 가 내려받는 TTS 모델 (약 256MB)
 ├── dump_monitor_jetson.py      # 실행 모듈 (RTSP/웹캠/파일 입력)
+├── mosaic.py                   # 사람 안면 모자이크 (OpenCV만 사용)
 ├── convert_tensorrt.sh         # TensorRT 변환 (Jetson에서 실행)
 ├── tts/                        # 음성 경고 방송 모듈 (아래 "음성 경고 방송" 참고)
 ├── setup_tts.sh                # TTS 환경 셋업 (venv + 모델 다운로드)
@@ -84,8 +86,38 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video
 
 ### 출력 (`output/<name>/`)
 - `events.jsonl` — 이벤트 로그 (시각, 클래스, **색상**, **night**(`"적외선"`/`"저조도"`/null), conf, 객체 id, 투기자 pid, bbox). append 방식이라 재시작해도 이어짐
-- `event_NNNN.jpg` — 이벤트 증거 스냅샷 (빨간 박스 + 투기자 pid)
-- `annotated.mp4` — 전체 주석 영상 (`--no-save-video`로 생략 가능)
+- `event_NNNN.jpg` — 이벤트 증거 스냅샷 (빨간 박스 + 투기자 pid). `--mosaic` 시 얼굴 가려짐
+- `event_NNNN_raw.jpg` — `--mosaic --raw-snapshot` 일 때만: 얼굴을 가리지 않은 원본 스냅샷
+- `annotated.mp4` — 전체 주석 영상 (`--no-save-video`로 생략 가능). `--mosaic` 시 얼굴 가려짐
+
+## 사람 안면 모자이크 (`--mosaic`)
+
+출력물(스냅샷 / `annotated.mp4` / `--show` 화면)에 찍히는 사람 얼굴을 픽셀화한다.
+**추론은 원본 프레임으로 하고 출력 직전에만 가리므로** 탐지·재식별·색상 판정에는 영향이 없다.
+OpenCV만 쓰며 추가 pip 의존성은 없다 ([mosaic.py](mosaic.py)).
+
+```bash
+python3 dump_monitor_jetson.py --source 0 --name cam01 --mosaic head          # 모델 불필요
+python3 dump_monitor_jetson.py --source 0 --name cam01 --mosaic face          # YuNet 얼굴 탐지
+python3 dump_monitor_jetson.py --source 0 --name cam01 --mosaic face --raw-snapshot
+```
+
+| 플래그 | 기본 | 의미 |
+|---|---|---|
+| `--mosaic` | `off` | `head`=ByteTrack 사람 박스의 상단 18%(머리)를 픽셀화. 비용 0, 사람이 탐지된 한 항상 가려짐 / `face`=YuNet으로 얼굴을 찾아 얼굴만 가리고, 못 찾으면(뒷모습·모자·저조도) 그 사람은 `head`로 폴백 |
+| `--face-model` | `models/face_detection_yunet_2023mar.onnx` | YuNet onnx 경로 |
+| `--raw-snapshot` | off | 얼굴을 가리지 않은 원본 스냅샷을 `event_NNNN_raw.jpg`로 **추가** 저장. 증거 보관용이므로 폴더 접근 통제가 필요하다 |
+
+- 픽셀 블록은 얼굴 크기에 비례(짧은 변을 8칸으로)해서 가까운 큰 얼굴도 윤곽이 남지 않는다.
+  강도는 `mosaic.py`의 `CELLS`(작을수록 강함), `HEAD_RATIO`, `FACE_PAD`로 조정
+- `face` 모드는 전체 프레임이 아니라 **사람 박스 크롭에만** YuNet을 돌리므로 Orin Nano CPU에서
+  프레임당 수 ms 수준이다. FPS가 아쉬우면 `head`로
+- YuNet은 `cv2.FaceDetectorYN`(OpenCV 4.5.4+, JetPack 6의 cv2 4.8 포함)으로 실행한다.
+  모델 파일이 없거나 cv2가 지원하지 않으면 경고 후 `head`로 자동 전환한다. 재다운로드:
+  `curl -L -o models/face_detection_yunet_2023mar.onnx https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx`
+- 종료 시 `[모자이크(face): 얼굴 N건 · head 폴백 M건]`으로 가린 건수를 출력한다.
+  폴백 비율이 높으면 카메라 각도상 얼굴이 잘 안 잡히는 것이므로 `head`가 더 안전하다
+- 한계: 사람 탐지(`PERSON_CONF=0.35`)에서 놓친 사람은 가리지 못한다
 
 ## 음성 경고 방송 (`--tts`)
 
@@ -170,8 +202,9 @@ python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-mode cache --
 
 ```bash
 python3 tests/test_color_naming.py      # 색상 판정 (모델 불필요)
+python3 tests/test_mosaic.py            # 픽셀화/머리영역/YuNet 폴백 (YOLO 불필요)
 python3 tests/test_tts_offline.py       # 문구/실시간 합성/캐시/재생큐/쿨다운/폴백 (모델·스피커 불필요)
-python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조도 발화→색상→방송 전 경로 (ultralytics 불필요)
+python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조도/모자이크 발화→색상→방송 전 경로 (ultralytics 불필요)
 .venv-tts/bin/python prerender_tts.py --check   # 실제 합성 + 스피커 재생
 ```
 
@@ -213,3 +246,8 @@ python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조
   합성 실패 시 사전 렌더링본 폴백. 사전 렌더링 재생은 `--tts-mode cache`로 유지
 - **야간 적외선/저조도 프레임에서는 색상 판정·방송 생략** (`night_mode`), `events.jsonl`에 `night` 필드 추가
 - 보드에서 확인할 것: Orin Nano 실측 합성 지연(`[TTS] 방송 (합성 N.Ns)` 로그). 지연이 크면 cache 모드 권장
+
+### 안면 모자이크 (2026-09-19)
+
+- `--mosaic head|face`: 출력물의 사람 얼굴 픽셀화 (OpenCV YuNet, 추가 의존성 없음). 추론에는 영향 없음
+- `--raw-snapshot`: 원본 스냅샷 별도 보관 옵션

@@ -8,6 +8,7 @@ ultralytics.YOLO를 스텁으로 대체하고 '사람이 파란 물체를 들고
   - events.jsonl에 color 필드가 들어가는지 ('파란색')
   - Announcer.announce가 (색상, 클래스)로 호출되고 실시간 합성(NullBackend) -> 재생까지 가는지
   - 야간 적외선/저조도 장면에서는 색상 없이(None) 방송하는지
+  - --mosaic head 로 스냅샷의 머리 영역이 가려지고, --raw-snapshot 원본은 그대로인지
 
   python3 tests/test_monitor_tts_hook.py
 """
@@ -77,8 +78,9 @@ def scene(f):
     return pbox, None, False
 
 
-def render_frames(dirpath, style):
+def render_frames(dirpath, style, textured_person=False):
     st = STYLES[style]
+    rng = np.random.default_rng(0)
     for f in range(1, N_FRAMES + 1):
         img = np.zeros((H, W, 3), np.uint8)
         img[:] = st["bg"]
@@ -86,6 +88,12 @@ def render_frames(dirpath, style):
         pbox, wbox, _ = scene(f)
         x1, y1, x2, y2 = (int(v) for v in pbox)
         cv2.rectangle(img, (max(0, x1), y1), (min(W, x2), y2), st["person"], -1)
+        if textured_person:                   # 모자이크 효과를 측정하려면 사람에 질감이 있어야 함
+            xa, xb = max(0, x1), min(W, x2)
+            if xb > xa:
+                noise = rng.integers(-40, 41, (y2 - y1, xb - xa, 3))
+                img[y1:y2, xa:xb] = np.clip(img[y1:y2, xa:xb].astype(np.int16) + noise,
+                                            0, 255).astype(np.uint8)
         if wbox is not None:
             a, b, c, d = (int(v) for v in wbox)
             cv2.rectangle(img, (max(0, a), b), (min(W, c), d), st["waste"], -1)
@@ -163,24 +171,25 @@ def spy(self, color, waste_name):
 Announcer.announce = spy
 
 
-def run_scenario(td, style):
+def run_scenario(td, style, name=None, extra_args=(), textured_person=False):
     """합성 영상을 만들고 main()을 실행. (events, calls, announcer) 반환."""
+    name = name or style
     calls.clear()
     announcers.clear()
     _Counter.f = 0
-    frames_dir = td / f"frames_{style}"
+    frames_dir = td / f"frames_{name}"
     frames_dir.mkdir()
-    render_frames(frames_dir, style)
+    render_frames(frames_dir, style, textured_person=textured_person)
     check("생성된 프레임 수", len(list(frames_dir.glob("*.png"))), N_FRAMES)
     # 사전 렌더링 캐시 없이, 기본(live) 모드로 NullBackend 즉석 합성 경로를 탄다
     sys.argv = ["dump_monitor_jetson.py",
                 "--source", str(frames_dir / "frame_%04d.png"),
-                "--name", style, "--out", str(td / "out"),
+                "--name", name, "--out", str(td / "out"),
                 "--no-save-video", "--tts", "--tts-backend", "null",
                 "--tts-cache", str(td / "no_cache"),
-                "--tts-cooldown", "0", "--tts-repeat-window", "0"]
+                "--tts-cooldown", "0", "--tts-repeat-window", "0", *extra_args]
     dm.main()
-    ev_path = td / "out" / style / "events.jsonl"
+    ev_path = td / "out" / name / "events.jsonl"
     check_true("events.jsonl 생성", ev_path.exists())
     events = [json.loads(l) for l in ev_path.read_text(encoding="utf-8").splitlines()
               if l.strip()]
@@ -225,6 +234,52 @@ with tempfile.TemporaryDirectory() as td:
         check("night 필드", events[0]["night"], "저조도")
     if got_calls:
         check("방송 인자(색상 없음)", got_calls[0], (None, "페트"))
+
+    print("\n4) --mosaic head --raw-snapshot: 스냅샷 머리 영역 가림, 원본은 그대로")
+    from mosaic import FaceMosaic, head_box
+    apply_calls = []
+    _orig_apply = FaceMosaic.apply
+
+    def spy_apply(self, frame, person_boxes):
+        apply_calls.append(len(person_boxes))
+        return _orig_apply(self, frame, person_boxes)
+
+    FaceMosaic.apply = spy_apply
+    try:
+        events, got_calls, ann = run_scenario(
+            td, "day", name="mosaic", extra_args=["--mosaic", "head", "--raw-snapshot"],
+            textured_person=True)
+    finally:
+        FaceMosaic.apply = _orig_apply
+    check("프레임마다 apply 호출", len(apply_calls), N_FRAMES)
+    check_true("매 프레임 사람 박스 전달", all(n == 1 for n in apply_calls))
+    if events:
+        ev = events[0]
+        check("이벤트 자체는 동일하게 발화", (ev["class"], ev["color"]), ("페트", "파란색"))
+        mos = cv2.imread(str(td / "out" / "mosaic" / "event_0001.jpg"))
+        raw = cv2.imread(str(td / "out" / "mosaic" / "event_0001_raw.jpg"))
+        check_true("모자이크 스냅샷 저장", mos is not None)
+        check_true("원본 스냅샷 저장(_raw)", raw is not None)
+        if mos is not None and raw is not None:
+            pbox, _w, _c = scene(ev["frame"])
+            _, hy1, _, hy2 = (int(v) for v in head_box(pbox))
+            hx1, hx2 = max(0, int(pbox[0])), min(W, int(pbox[2]))   # 사람 박스 안쪽만
+
+            def flat_ratio(img):
+                """이웃 픽셀과 거의 같은(|차|<=3) 픽셀 비율. 노이즈 질감은 낮고, 픽셀화된
+                블록 안은 균일하므로 높다 (JPEG 오차 허용)."""
+                roi = img[hy1:hy2, hx1:hx2].astype(np.int16)
+                d = np.abs(roi[:, 1:] - roi[:, :-1]).max(axis=2)
+                return float((d <= 3).mean())
+
+            f_r, f_m = flat_ratio(raw), flat_ratio(mos)
+            check_true("머리 영역: 원본은 질감, 모자이크본은 블록 균일",
+                       f_r < 0.3 and f_m > 0.6, f"균일 비율 {f_r:.2f} -> {f_m:.2f}")
+            by1 = hy2 + 10                          # 머리 아래 몸통 영역은 두 파일이 같아야 함
+            body_m = mos[by1:int(pbox[3]), hx1:hx2]
+            body_r = raw[by1:int(pbox[3]), hx1:hx2]
+            diff = np.abs(body_m.astype(np.int16) - body_r.astype(np.int16)).mean()
+            check_true("몸통 영역은 두 스냅샷이 동일(JPEG 오차 이내)", diff < 3.0, f"평균차 {diff:.2f}")
 
 Announcer.announce = _orig_announce
 

@@ -7,12 +7,15 @@
   (개발 PC의 work/scripts/dump_monitor.py v2와 동일 로직)
 - --tts: 발화 시 '색상 + 쓰레기 종류'를 특정한 한국어 경고를 그 자리에서 합성해 방송 (tts/ 참고)
   야간 적외선/저조도 프레임에서는 색상 판정이 무의미하므로 종류만 방송한다
+- --mosaic head|face: 출력물(스냅샷/영상/화면)의 사람 얼굴을 픽셀화 (mosaic.py 참고).
+  추론은 원본 프레임으로 하므로 탐지 정확도에는 영향 없음
 
 usage:
   python3 dump_monitor_jetson.py --source rtsp://... --name cam01
   python3 dump_monitor_jetson.py --source 0 --name webcam --show
   python3 dump_monitor_jetson.py --source clip.mp4 --name test --no-save-video
   python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-location "정문 수거함 앞"
+  python3 dump_monitor_jetson.py --source 0 --name cam01 --mosaic face
 """
 import argparse
 import json
@@ -23,6 +26,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+from mosaic import FaceMosaic
 
 try:                                          # TTS는 선택 기능 — 없어도 감시는 동작
     from tts import Announcer, dominant_color_name
@@ -226,6 +231,14 @@ def main():
                     help="(cache 모드) 캐시 미스 시 즉석 합성하지 않고 방송을 건너뜀")
     ap.add_argument("--tts-model", default="supertonic-2", help="합성 모델")
     ap.add_argument("--tts-voice", default="M4", help="목소리 (M1~M5/F1~F5)")
+    ap.add_argument("--mosaic", default="off", choices=["off", "head", "face"],
+                    help="출력물의 사람 얼굴 픽셀화. head=사람 박스 상단(모델 불필요) / "
+                         "face=YuNet 얼굴 탐지(못 찾으면 head 폴백)")
+    ap.add_argument("--face-model", default=None,
+                    help="YuNet onnx 경로 (기본 models/face_detection_yunet_2023mar.onnx)")
+    ap.add_argument("--raw-snapshot", action="store_true",
+                    help="--mosaic 사용 시 모자이크 없는 원본 스냅샷도 event_NNNN_raw.jpg로 저장 "
+                         "(증거 보관용. 접근 통제 필요)")
     args = ap.parse_args()
 
     out_dir = Path(args.out) / args.name
@@ -244,6 +257,10 @@ def main():
                 location=args.tts_location, cooldown=args.tts_cooldown,
                 repeat_window=args.tts_repeat_window,
                 allow_runtime_synth=not args.tts_no_runtime_synth, **tts_kw)
+    mosaic = FaceMosaic(args.mosaic, model_path=args.face_model)
+    if mosaic.enabled:
+        print(f"[모자이크] {mosaic.mode} 모드"
+              + (" · 원본 스냅샷 별도 저장" if args.raw_snapshot else ""))
     waste_model, waste_path = load_model(args.waste_model or "waste10_yolo26n")
     person_model, person_path = load_model(args.person_model or "person_yolo26n")
     print(f"waste={Path(waste_path).name} person={Path(person_path).name} -> {out_dir}")
@@ -357,6 +374,13 @@ def main():
             objects.append(o)
         objects = [o for o in objects if frame_idx - o.last_seen <= LOST_KEEP]
 
+        # 추론·색상 크롭·재식별이 모두 끝난 뒤, 출력(스냅샷/영상/화면)에 쓰일 프레임의 얼굴을 가린다.
+        # raw는 원본 스냅샷 저장과 색상 판정 폴백(best_crop 없을 때)에만 쓴다.
+        raw = frame
+        if mosaic.enabled:
+            raw = frame.copy()
+            mosaic.apply(frame, person_boxes)
+
         for o in objects:
             if o.baseline or o.fired or frame_idx - o.last_seen > MISS_TOLERANCE:
                 continue
@@ -401,9 +425,9 @@ def main():
                     if night is None:
                         color = dominant_color_name(o.best_crop)
                 else:
-                    night = night_mode(frame)
+                    night = night_mode(raw)
                     if night is None:
-                        color = dominant_color_name(frame, o.box)
+                        color = dominant_color_name(raw, o.box)
             ev = {"event": n_events, "frame": frame_idx, "sec": round(frame_idx / fps, 1),
                   "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                   "class": WASTE_NAMES[o.cls], "color": color, "night": night,
@@ -419,12 +443,17 @@ def main():
                   f"{'(소지품 매칭)' if o.owner_strong else ''}", flush=True)
             if announcer is not None:
                 announcer.announce(color, WASTE_NAMES[o.cls])
-            snap = frame.copy()
             x1, y1, x2, y2 = map(int, o.box)
+            label = f"DUMPING SUSPECT #{n_events} (person {o.owner_pid})"
+            snap = frame.copy()
             cv2.rectangle(snap, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            cv2.putText(snap, f"DUMPING SUSPECT #{n_events} (person {o.owner_pid})",
-                        (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
+            cv2.putText(snap, label, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
             cv2.imwrite(str(out_dir / f"event_{n_events:04d}.jpg"), snap)
+            if mosaic.enabled and args.raw_snapshot:
+                snap = raw.copy()
+                cv2.rectangle(snap, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                cv2.putText(snap, label, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
+                cv2.imwrite(str(out_dir / f"event_{n_events:04d}_raw.jpg"), snap)
 
         if writer is not None or args.show:
             for pid, p in persons:
@@ -461,6 +490,8 @@ def main():
     events_f.close()
     print(f"완료: {frame_idx}프레임, {dt:.1f}s ({frame_idx / max(dt, 0.1):.1f} FPS), "
           f"이벤트 {n_events}건 -> {out_dir}")
+    if mosaic.enabled:
+        print(f"[{mosaic.summary()}]")
     if announcer is not None:
         announcer.close()          # 큐에 남은 방송을 끝까지 재생한 뒤 종료
 
