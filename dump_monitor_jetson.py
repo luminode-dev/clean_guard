@@ -5,7 +5,8 @@
 - 모델은 models/ 폴더에서 .engine(TensorRT) > .onnx > .pt 순으로 자동 선택
 - 로직: 소지품-사람 귀속, LOST 객체 재식별(Re-ID), owner 이탈 시 발화
   (개발 PC의 work/scripts/dump_monitor.py v2와 동일 로직)
-- --tts: 발화 시 '색상 + 쓰레기 종류'를 특정한 한국어 경고를 스피커로 방송 (tts/ 참고)
+- --tts: 발화 시 '색상 + 쓰레기 종류'를 특정한 한국어 경고를 그 자리에서 합성해 방송 (tts/ 참고)
+  야간 적외선/저조도 프레임에서는 색상 판정이 무의미하므로 종류만 방송한다
 
 usage:
   python3 dump_monitor_jetson.py --source rtsp://... --name cam01
@@ -25,9 +26,9 @@ from ultralytics import YOLO
 
 try:                                          # TTS는 선택 기능 — 없어도 감시는 동작
     from tts import Announcer, dominant_color_name
-    from tts.color_naming import crop_box
+    from tts.color_naming import crop_box, night_mode
 except Exception as _tts_err:                 # noqa: BLE001
-    Announcer = dominant_color_name = crop_box = None
+    Announcer = dominant_color_name = crop_box = night_mode = None
     _TTS_IMPORT_ERROR = _tts_err
 else:
     _TTS_IMPORT_ERROR = None
@@ -179,6 +180,7 @@ class WasteObject:
         # 방송 색상은 '가장 확신했던 프레임'의 크롭에서 뽑는다 (발화 프레임 1장보다 안정적)
         self.best_conf = -1.0
         self.best_crop = None
+        self.best_night = None      # 그 크롭을 딴 프레임의 조명 상태 ("적외선"/"저조도"/None)
         self._update_crop(frame, box, conf)
 
     def _update_crop(self, frame, box, conf):
@@ -187,6 +189,7 @@ class WasteObject:
         c = best_color_crop(frame, box)
         if c is not None:
             self.best_conf, self.best_crop = conf, c
+            self.best_night = night_mode(frame) if night_mode is not None else None
 
     def seen(self, box, conf, frame_idx, hist, frame=None):
         self._update_crop(frame, box, conf)
@@ -206,21 +209,23 @@ def main():
     ap.add_argument("--show", action="store_true", help="화면 표시 (모니터 연결 시)")
     ap.add_argument("--no-save-video", action="store_true", help="주석 영상 저장 생략")
     ap.add_argument("--tts", action="store_true", help="이벤트 발생 시 음성 경고 방송")
+    ap.add_argument("--tts-mode", default="live", choices=["live", "cache"],
+                    help="live=이벤트마다 문구를 즉석 합성해 방송(기본) / "
+                         "cache=prerender_tts.py로 만든 사전 렌더링 wav만 재생")
     ap.add_argument("--tts-backend", default="supertonic", choices=["supertonic", "null"],
-                    help="캐시 미스 시 사용할 합성 백엔드 (null=무음, 점검용)")
-    ap.add_argument("--tts-cache", default=None, help="방송 wav 캐시 폴더 (기본 cache/tts)")
+                    help="합성 백엔드 (null=무음, 배선 점검용)")
+    ap.add_argument("--tts-cache", default=None,
+                    help="사전 렌더링 wav 폴더 (기본 cache/tts). live 모드에선 합성 실패 시 폴백용")
     ap.add_argument("--tts-location", default=None,
-                    help="방송에 넣을 장소명. 지정 시 그 장소 전용 캐시를 따로 만들어야 함")
+                    help="방송에 넣을 장소명 (cache 모드면 그 장소 전용 캐시가 있어야 함)")
     ap.add_argument("--tts-cooldown", type=float, default=12.0,
                     help="방송 간 최소 간격(초). 문장 길이(약 9초)보다 크게 두어 대기열 적체를 막는다")
     ap.add_argument("--tts-repeat-window", type=float, default=30.0,
                     help="같은 (색상,종류) 조합 재방송 억제 시간(초)")
     ap.add_argument("--tts-no-runtime-synth", action="store_true",
-                    help="캐시 미스 시 실시간 합성을 하지 않고 방송을 건너뜀")
-    ap.add_argument("--tts-model", default="supertonic-2",
-                    help="캐시 미스 합성에 쓸 모델. 사전 렌더링과 같은 값이어야 함")
-    ap.add_argument("--tts-voice", default="M4",
-                    help="캐시 미스 합성에 쓸 목소리(M1~M5/F1~F5). 사전 렌더링과 같은 값이어야 함")
+                    help="(cache 모드) 캐시 미스 시 즉석 합성하지 않고 방송을 건너뜀")
+    ap.add_argument("--tts-model", default="supertonic-2", help="합성 모델")
+    ap.add_argument("--tts-voice", default="M4", help="목소리 (M1~M5/F1~F5)")
     args = ap.parse_args()
 
     out_dir = Path(args.out) / args.name
@@ -234,6 +239,7 @@ def main():
             tts_kw = ({} if args.tts_backend == "null"
                       else {"model": args.tts_model, "voice": args.tts_voice})
             announcer = Announcer(
+                mode=args.tts_mode,
                 cache_dir=args.tts_cache, backend=args.tts_backend,
                 location=args.tts_location, cooldown=args.tts_cooldown,
                 repeat_window=args.tts_repeat_window,
@@ -386,20 +392,29 @@ def main():
                 continue
             o.fired = True
             n_events += 1
-            color = None
+            color, night = None, None
             if dominant_color_name is not None:
-                # best_crop(최고 확신 프레임)이 있으면 그것으로, 없으면 현재 프레임에서
-                color = (dominant_color_name(o.best_crop) if o.best_crop is not None
-                         else dominant_color_name(frame, o.box))
+                # best_crop(최고 확신 프레임)이 있으면 그것으로, 없으면 현재 프레임에서.
+                # 야간 적외선/저조도 프레임이면 색상은 신뢰할 수 없으므로 판정하지 않는다.
+                if o.best_crop is not None:
+                    night = o.best_night
+                    if night is None:
+                        color = dominant_color_name(o.best_crop)
+                else:
+                    night = night_mode(frame)
+                    if night is None:
+                        color = dominant_color_name(frame, o.box)
             ev = {"event": n_events, "frame": frame_idx, "sec": round(frame_idx / fps, 1),
                   "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                  "class": WASTE_NAMES[o.cls], "color": color, "conf": round(o.conf, 2),
+                  "class": WASTE_NAMES[o.cls], "color": color, "night": night,
+                  "conf": round(o.conf, 2),
                   "obj_id": o.id, "owner_pid": o.owner_pid,
                   "owner_matched": o.owner_strong, "box": [round(v) for v in o.box]}
             events_f.write(json.dumps(ev, ensure_ascii=False) + "\n")
             events_f.flush()
             print(f"[이벤트 {n_events}] {ev['ts']} 무단투기 의심: "
-                  f"{color + ' ' if color else ''}{ev['class']} "
+                  f"{color + ' ' if color else ''}{ev['class']}"
+                  f"{f' ({night}: 색상 생략)' if night else ''} "
                   f"obj#{o.id} 투기자 pid={o.owner_pid}"
                   f"{'(소지품 매칭)' if o.owner_strong else ''}", flush=True)
             if announcer is not None:

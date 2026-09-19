@@ -17,8 +17,8 @@ jetson_deploy/
 ├── convert_tensorrt.sh         # TensorRT 변환 (Jetson에서 실행)
 ├── tts/                        # 음성 경고 방송 모듈 (아래 "음성 경고 방송" 참고)
 ├── setup_tts.sh                # TTS 환경 셋업 (venv + 모델 다운로드)
-├── prerender_tts.py            # 방송 문구 사전 렌더링 CLI
-├── cache/tts/                  # ← 사전 렌더링된 방송 wav 120개 (약 90MB)
+├── prerender_tts.py            # 방송 문구 사전 렌더링 CLI (선택: cache 모드 / 폴백용)
+├── cache/tts/                  # ← 사전 렌더링 wav (선택). live 모드에선 합성 실패 시 폴백으로만 사용
 ├── tests/
 ├── requirements.txt
 └── README.md
@@ -83,7 +83,7 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video
 특정 포맷을 강제하려면 `--waste-model models/waste10_yolo26n.pt` 처럼 확장자까지 지정한다.
 
 ### 출력 (`output/<name>/`)
-- `events.jsonl` — 이벤트 로그 (시각, 클래스, **색상**, conf, 객체 id, 투기자 pid, bbox). append 방식이라 재시작해도 이어짐
+- `events.jsonl` — 이벤트 로그 (시각, 클래스, **색상**, **night**(`"적외선"`/`"저조도"`/null), conf, 객체 id, 투기자 pid, bbox). append 방식이라 재시작해도 이어짐
 - `event_NNNN.jpg` — 이벤트 증거 스냅샷 (빨간 박스 + 투기자 pid)
 - `annotated.mp4` — 전체 주석 영상 (`--no-save-video`로 생략 가능)
 
@@ -92,22 +92,31 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video
 투기 발화 시 **"[색상] [쓰레기 종류]를 무단으로 버리셨습니다. 되가져가 주시기 바랍니다.
 이곳은 CCTV 녹화 중입니다."** 를 현장 스피커로 방송한다. 클라우드 없이
 [Supertonic](https://huggingface.co/Supertone/supertonic-2) ONNX 모델로 온디바이스 합성한다.
+**야간 적외선(흑백)·저조도 프레임에서는 색상을 판정하지 않고 종류만 방송한다**
+("페트병을 무단으로 버리셨습니다…").
 
 ### 설계 원칙
 
-- **사전 렌더링**: (색상 11 + 색상없음) × 쓰레기 10종 = **120개 문장을 미리 wav로 합성**해
-  `cache/tts/`에 둔다. 이벤트 시점에는 파일 재생만 하므로 지연 0, 추론 자원 경합 없음
+- **실시간 합성 (기본, `--tts-mode live`)**: 이벤트가 나면 문구를 그 자리에서 합성해 방송한다.
+  합성은 감시 루프와 분리된 스레드가 담당하고, `synth_worker.py --serve` **상주 프로세스**에
+  작업을 보내므로 모델 로드(수 초~수십 초)는 시작 시 한 번뿐이고 이벤트 때는 합성 시간만 든다
+  (Orin Nano CPU에서 한 문장 수 초 수준). 감시 루프는 방송 요청만 큐에 넣고 즉시 돌아온다.
+  합성 워커는 시작 직후 미리 띄워 두며(예열), 죽으면 다음 방송 때 자동 재시작한다
 - **의존성 격리**: onnxruntime은 numpy 2.x를 요구하고 JetPack 기본 cv2는 numpy 1.x 빌드라
   섞이면 cv2가 깨진다. TTS 의존성은 전부 `.venv-tts/`에 격리하고, 합성은 항상 그 venv의
   서브프로세스([tts/synth_worker.py](tts/synth_worker.py))에서 실행한다.
   **감시 프로세스에는 추가 런타임 의존성이 없다**
-- **장애 격리**: 모델·스피커·캐시에 무슨 문제가 생겨도 `[TTS 경고]`만 남기고 감시는 계속된다
+- **장애 격리**: 모델·스피커·워커에 무슨 문제가 생겨도 `[TTS 경고]`만 남기고 감시는 계속된다.
+  실시간 합성이 실패했는데 `cache/tts/`에 같은 문구의 사전 렌더링본이 있으면 그것을 대신 튼다
+- **사전 렌더링 (선택, `--tts-mode cache`)**: (색상 11 + 색상없음) × 쓰레기 10종 = 120문장을
+  `prerender_tts.py --all`로 미리 만들어 두고 재생만 하는 이전 방식. 합성 지연이 0이지만
+  장소명 등 문구를 바꿀 때마다 다시 만들어야 한다. live 모드의 폴백 캐시로도 쓰인다
 
 ### 셋업 (보드에서 1회)
 
 ```bash
 bash setup_tts.sh          # venv + pip 부트스트랩 + supertonic-2 다운로드 + 스모크 테스트
-# 방송 문구 120개 사전 렌더링 (약 20분, ~90MB). 모델 폴더는 models/tts/ 에서 자동 인식
+# (선택) 합성 실패 시 폴백용 / cache 모드용 사전 렌더링 (약 20분, ~90MB)
 .venv-tts/bin/python prerender_tts.py --all
 ```
 
@@ -119,21 +128,28 @@ bash setup_tts.sh          # venv + pip 부트스트랩 + supertonic-2 다운로
 ```bash
 python3 dump_monitor_jetson.py --source 0 --name cam01 --tts
 
-# 장소명을 방송에 포함 (그 장소 전용 캐시를 먼저 만들어야 함)
-.venv-tts/bin/python prerender_tts.py --all --location "정문 수거함 앞"
+# 장소명을 방송에 포함 (live 모드는 사전 작업 없이 바로 됨)
 python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-location "정문 수거함 앞"
+
+# 사전 렌더링본만 재생 (cache 모드; 장소명을 쓰려면 그 장소 전용 캐시를 먼저 만들어야 함)
+.venv-tts/bin/python prerender_tts.py --all --location "정문 수거함 앞"
+python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-mode cache --tts-location "정문 수거함 앞"
 ```
+
+시작 로그에 `[TTS] 합성 워커 준비 완료 (N.Ns)`가 보이면 모델이 올라온 것이고, 이벤트 때는
+`[TTS] 방송 (합성 N.Ns): …`로 실제 합성 시간이 찍힌다.
 
 | 플래그 | 기본 | 의미 |
 |---|---|---|
 | `--tts` | off | 방송 활성화 |
+| `--tts-mode` | `live` | `live`=이벤트마다 즉석 합성 / `cache`=사전 렌더링 wav만 재생 |
 | `--tts-cooldown` | 12.0 | 방송 간 최소 간격(초). 문장이 약 9초라 이보다 짧게 두면 대기열이 쌓인다 |
 | `--tts-repeat-window` | 30.0 | 같은 (색상, 종류) 조합 재방송 억제 시간(초) |
 | `--tts-location` | 없음 | 방송에 넣을 장소명 |
-| `--tts-cache` | `cache/tts` | 방송 wav 캐시 폴더 |
-| `--tts-no-runtime-synth` | off | 캐시 미스 시 실시간 합성 대신 방송 생략 (자원 보호) |
+| `--tts-cache` | `cache/tts` | 사전 렌더링 wav 폴더. live 모드에선 합성 실패 시 폴백용 |
+| `--tts-no-runtime-synth` | off | (cache 모드) 캐시 미스 시 즉석 합성 대신 방송 생략 |
 | `--tts-backend` | `supertonic` | `null`로 두면 무음 wav — 배선 점검용 |
-| `--tts-model` / `--tts-voice` | `supertonic-2` / `M4` | 캐시 미스 합성용. 사전 렌더링과 같은 값이어야 목소리가 일관됨 |
+| `--tts-model` / `--tts-voice` | `supertonic-2` / `M4` | 합성 모델 / 목소리 (M1~M5, F1~F5) |
 
 ### 색상 판정
 
@@ -142,12 +158,20 @@ python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-location "정
 **이벤트 프레임 1장이 아니라 그 객체를 가장 확신했던 프레임의 크롭**(`WasteObject.best_crop`)에서
 색을 뽑는다. 유채색 픽셀이 30% 미만이면 무채색(검정 봉투, 흰 스티로폼 등)으로 판정한다.
 
+**야간에는 색상을 판정하지 않는다.** `night_mode(frame)`가 크롭을 딴 프레임 전체를 보고
+- 평균 밝기(V) < 60 → `"저조도"`
+- 유채색 픽셀(S≥45, V≥55) 비율 < 1% → `"적외선"` (IR 모드는 B=G=R이라 유채색이 사실상 없음.
+  낮의 회색 콘크리트 바닥은 표지판·차량·초목 등으로 이 비율을 훌쩍 넘긴다)
+
+둘 중 하나면 `color=null`로 기록·방송하고, 이벤트 로그 `night` 필드와 콘솔에 사유를 남긴다.
+임계값은 `tts/color_naming.py` 상단 `NIGHT_V_MEAN`, `IR_CHROMA_FRAC`.
+
 ### 검증
 
 ```bash
 python3 tests/test_color_naming.py      # 색상 판정 (모델 불필요)
-python3 tests/test_tts_offline.py       # 문구/캐시/재생큐/쿨다운 (모델·스피커 불필요)
-python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 발화→색상→방송 전 경로 (ultralytics 불필요)
+python3 tests/test_tts_offline.py       # 문구/실시간 합성/캐시/재생큐/쿨다운/폴백 (모델·스피커 불필요)
+python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조도 발화→색상→방송 전 경로 (ultralytics 불필요)
 .venv-tts/bin/python prerender_tts.py --check   # 실제 합성 + 스피커 재생
 ```
 
@@ -182,3 +206,10 @@ python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 발화→색상→�
 - 이벤트 로직 v6: 소지품-사람 귀속, LOST 재식별, owner 이탈 5프레임 확인, **배경 차분으로 기존 적치물 오발화 억제**
 - 합성 CCTV 투기 클립 검증: 주·야간 검정봉투 투기 정상 발화, 기존 더미 억제, 비투기 클립 오탐 0
 - 남은 한계: 클립 종료 직전 투기(잔류 판정 프레임 부족)는 미발화 — 연속 스트림 운영에서는 해당 없음
+
+### 방송 v2 (2026-09-19)
+
+- 방송 문구를 이벤트 시점에 **즉석 합성**(`--tts-mode live`, 기본). 상주 합성 워커로 모델 로드는 1회,
+  합성 실패 시 사전 렌더링본 폴백. 사전 렌더링 재생은 `--tts-mode cache`로 유지
+- **야간 적외선/저조도 프레임에서는 색상 판정·방송 생략** (`night_mode`), `events.jsonl`에 `night` 필드 추가
+- 보드에서 확인할 것: Orin Nano 실측 합성 지연(`[TTS] 방송 (합성 N.Ns)` 로그). 지연이 크면 cache 모드 권장

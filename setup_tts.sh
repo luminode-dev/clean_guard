@@ -114,13 +114,10 @@ cat <<EOF
 셋업 완료.
 
 다음 단계:
-  # 방송 문구 전체(색상 11 + 무색상) × 쓰레기 10종 = 120개 사전 렌더링
-  $VENV/bin/python $HERE/prerender_tts.py --all --model $MODEL --model-dir $MODEL_DIR --voice $VOICE
-
-  # 감시 + 방송 실행
+  # 감시 + 방송 실행 (이벤트마다 문구를 즉석 합성 — 사전 작업 불필요)
   python3 $HERE/dump_monitor_jetson.py --source 0 --name cam01 --tts
-
-장소명을 넣어 방송하려면 --tts-location 과 동일한 값으로 캐시를 먼저 만드세요:
-  $VENV/bin/python $HERE/prerender_tts.py --all --location "정문 수거함 앞" ...
   python3 $HERE/dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-location "정문 수거함 앞"
+
+  # (선택) 합성 실패 시 폴백용 / --tts-mode cache 용 사전 렌더링 120개
+  $VENV/bin/python $HERE/prerender_tts.py --all --model $MODEL --model-dir $MODEL_DIR --voice $VOICE
 EOF

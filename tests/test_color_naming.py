@@ -11,7 +11,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tts.color_naming import COLOR_NAMES, crop_box, dominant_color_name  # noqa: E402
+from tts.color_naming import (COLOR_NAMES, crop_box, dominant_color_name,  # noqa: E402
+                              night_mode)
 
 fails = []
 
@@ -87,6 +88,26 @@ print("\n6) 큰 프레임 안의 작은 박스")
 big = patch((128, 128, 128), 480)
 big[100:200, 300:380] = (30, 200, 30)
 check("초록 객체", dominant_color_name(big, [300, 100, 380, 200]), "초록색")
+
+print("\n7) 야간 적외선/저조도 판정 (프레임 전체 기준)")
+day = patch((90, 120, 110), 480)                   # 약간 녹색 기운의 낮 배경
+day[200:300, 100:200] = (30, 30, 200)              # 빨간 물체
+day[0:80, :] = (230, 200, 160)                     # 하늘
+check("낮 프레임", night_mode(day), None)
+gray_day = patch((128, 128, 128), 480)             # 회색 콘크리트가 대부분
+gray_day[100:200, 300:380] = (30, 200, 30)         # 초록 물체 하나 (≈3%)
+check("낮 회색 바닥 + 물체 하나", night_mode(gray_day), None)
+ir = patch((140, 140, 140), 480)                   # 적외선: B=G=R
+ir[100:300, 100:300] = (60, 60, 60)
+ir[50:80, 400:470] = (220, 220, 220)
+check("적외선(흑백) 프레임", night_mode(ir), "적외선")
+rng = np.random.default_rng(0)
+ir_noisy = np.clip(ir.astype(np.int16) + rng.integers(-6, 7, ir.shape), 0, 255).astype(np.uint8)
+check("적외선 + 압축 노이즈", night_mode(ir_noisy), "적외선")
+dark = patch((25, 30, 28), 480)                    # 저조도: 색은 있지만 어두움
+dark[200:300, 100:200] = (20, 20, 70)
+check("저조도 프레임", night_mode(dark), "저조도")
+check("None 프레임", night_mode(None), None)
 
 print()
 if fails:

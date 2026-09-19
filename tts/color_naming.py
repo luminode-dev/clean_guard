@@ -23,6 +23,14 @@ V_BROWN = 120         # 적/주황 계열이 이보다 어두우면 갈색
 CHROMA_PREFER = 0.30  # 유채색 픽셀 비율이 이 이상이면 유채색으로 명명
 MARGIN = 0.15         # 박스 상하좌우에서 잘라낼 비율 (배경 오염 제거)
 
+# --- 야간/저조도 판정 (프레임 전체 기준) ---
+# 적외선 모드는 B=G=R인 흑백 영상이라 채도가 사실상 0이고, 저조도는 색 정보가
+# 노이즈에 묻혀 판정이 무의미하다. 둘 다 색상을 방송하지 않는다.
+NIGHT_V_MEAN = 60     # 프레임 평균 밝기(V)가 이보다 낮으면 '저조도'
+IR_CHROMA_FRAC = 0.01 # 유채색 픽셀(S>=S_ACHROMA, V>=V_BLACK) 비율이 이보다 낮으면 '적외선(흑백)'
+                      # 적외선은 B=G=R이라 유채색 픽셀이 사실상 0. 낮에는 회색 콘크리트
+                      # 바닥이 대부분이어도 표지판/차량/초목 등으로 이 비율을 훌쩍 넘긴다
+
 # 유채색 H 구간 -> 이름. (하한, 상한, 이름), 상한 포함.
 _HUE_BINS = [
     (0, 9, "빨간색"),
@@ -54,6 +62,27 @@ def crop_box(frame_bgr, box, margin=MARGIN):
         return None
     crop = frame_bgr[y1:y2, x1:x2]
     return crop if crop.size else None
+
+
+def night_mode(frame_bgr):
+    """프레임이 야간 적외선(흑백) 또는 저조도면 사유 문자열, 아니면 None.
+
+    반환값: "적외선" | "저조도" | None. 색상 판정/방송 여부를 결정하는 데 쓴다.
+    64x64로 축소해 계산하므로 프레임마다 불러도 부담이 없다.
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return None
+    import cv2
+
+    small = cv2.resize(frame_bgr, (64, 64), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    S, V = hsv[..., 1], hsv[..., 2]
+    if float(V.mean()) < NIGHT_V_MEAN:
+        return "저조도"
+    chroma = (S >= S_ACHROMA) & (V >= V_BLACK)
+    if float(chroma.mean()) < IR_CHROMA_FRAC:
+        return "적외선"
+    return None
 
 
 def dominant_color_name(frame_bgr, box=None):

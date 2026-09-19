@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 """TTS 방송 모듈 오프라인 통합 테스트 (모델/네트워크/스피커 불필요).
 
-NullBackend로 문구 -> 캐시 -> 재생 큐 전 경로를 검증한다.
+NullBackend로 문구 -> 실시간 합성 / 캐시 -> 재생 큐 전 경로를 검증한다.
 
   python3 tests/test_tts_offline.py
 """
+import os
 import sys
 import tempfile
 import time
@@ -106,8 +107,8 @@ with tempfile.TemporaryDirectory() as td:
     pl.stop()
     check_true("재생 시도됨", pl.played > 0, f"played={pl.played} dropped={pl.dropped}")
 
-    print("\n7) Announcer 쿨다운 / 중복억제")
-    ann = Announcer(cache_dir=td / "cache", backend="null", cooldown=0.0,
+    print("\n7) Announcer(cache 모드) 쿨다운 / 중복억제")
+    ann = Announcer(mode="cache", cache_dir=td / "cache", backend="null", cooldown=0.0,
                     repeat_window=60.0, verbose=False)
     ann.player.cmd = ["true"]                          # 스피커 없이 검증
     check_true("활성화", ann.enabled)
@@ -117,7 +118,7 @@ with tempfile.TemporaryDirectory() as td:
     check_true("색상 None도 통과", ann.announce(None, "의류"))
     check("억제 카운트", ann.n_suppressed, 1)
 
-    ann2 = Announcer(cache_dir=td / "cache", backend="null", cooldown=99.0,
+    ann2 = Announcer(mode="cache", cache_dir=td / "cache", backend="null", cooldown=99.0,
                      repeat_window=0.0, verbose=False)
     ann2.player.cmd = ["true"]
     check_true("쿨다운 전 1차 통과", ann2.announce("흰색", "스티로폼"))
@@ -125,8 +126,8 @@ with tempfile.TemporaryDirectory() as td:
     ann.close(drain=False)
     ann2.close(drain=False)
 
-    print("\n8) 장애 내성 — 캐시 미스 + 합성 금지")
-    ann3 = Announcer(cache_dir=td / "empty", backend="null", cooldown=0.0,
+    print("\n8) 장애 내성 — cache 모드 캐시 미스 + 합성 금지")
+    ann3 = Announcer(mode="cache", cache_dir=td / "empty", backend="null", cooldown=0.0,
                      repeat_window=0.0, allow_runtime_synth=False, verbose=False)
     ann3.player.cmd = ["true"]
     check_true("미스 시 False 반환(예외 없음)", not ann3.announce("파란색", "페트"))
@@ -138,6 +139,60 @@ with tempfile.TemporaryDirectory() as td:
     check_true("enabled=False", not ann4.enabled)
     check_true("announce가 조용히 False", not ann4.announce("파란색", "페트"))
     ann4.close()
+
+    print("\n10) live 모드 — 이벤트 시 즉석 합성 -> 재생 -> 임시파일 정리")
+    played_paths = []
+    live = Announcer(mode="live", cache_dir=td / "empty", backend="null",
+                     cooldown=0.0, repeat_window=0.0, verbose=False)
+    live.player.cmd = ["true"]
+    _orig_submit = live.player.submit
+
+    def spy_submit(path, cleanup=False):
+        played_paths.append((str(path), cleanup))
+        return _orig_submit(path, cleanup=cleanup)
+
+    live.player.submit = spy_submit
+    check_true("활성화", live.enabled)
+    t0 = time.monotonic()
+    check_true("캐시 없이도 방송 요청 수락", live.announce("파란색", "페트"))
+    check_true("announce는 즉시 반환(합성을 기다리지 않음)", time.monotonic() - t0 < 0.1)
+    live.announce(None, "캔")                       # 색상 없는 문구도 합성
+    t_end = time.monotonic() + 5
+    while len(played_paths) < 2 and time.monotonic() < t_end:
+        time.sleep(0.05)
+    check("합성된 wav 2건 재생 큐 투입", len(played_paths), 2)
+    check_true("임시 wav는 cleanup 플래그로 투입", all(c for _, c in played_paths))
+    live.close()
+    check_true("재생 후 임시 wav 삭제됨",
+               all(not os.path.exists(p_) for p_, _ in played_paths))
+    check("합성 실패 0건", live.n_synth_fail, 0)
+    check("방송 카운트", live.n_played, 2)
+
+    print("\n11) live 모드 — 합성 실패 시 사전 렌더링본 폴백")
+    live2 = Announcer(mode="live", cache_dir=td / "cache", backend="null",
+                      cooldown=0.0, repeat_window=0.0, verbose=False)
+    live2.player.cmd = ["true"]
+    fb_paths = []
+    _orig_submit2 = live2.player.submit
+
+    def spy_submit2(path, cleanup=False):
+        fb_paths.append(str(path))
+        return _orig_submit2(path, cleanup=cleanup)
+
+    live2.player.submit = spy_submit2
+
+    def boom(text, out):
+        raise RuntimeError("워커 죽음")
+
+    live2.backend.render_one = boom
+    live2.announce("파란색", "페트")              # 5)에서 캐시된 조합
+    t_end = time.monotonic() + 5
+    while not fb_paths and time.monotonic() < t_end:
+        time.sleep(0.05)
+    check("폴백 재생 1건", len(fb_paths), 1)
+    check_true("캐시 wav로 재생", bool(fb_paths) and fb_paths[0].startswith(str(td / "cache")))
+    check("합성 실패 카운트", live2.n_synth_fail, 1)
+    live2.close(drain=False)
 
 print()
 if fails:

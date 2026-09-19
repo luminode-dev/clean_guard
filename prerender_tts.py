@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""방송 문구 사전 렌더링 CLI.
+"""방송 문구 사전 렌더링 CLI (선택 사항).
 
-이벤트 발생 시 지연을 0으로 만들기 위해 (색상 11 + 색상없음) × 쓰레기 10종 = 120개
-문장을 미리 합성해 cache/tts/ 에 wav로 저장한다.
+(색상 11 + 색상없음) × 쓰레기 10종 = 120개 문장을 미리 합성해 cache/tts/ 에 wav로 저장한다.
+기본 운용(--tts-mode live)은 이벤트 때 즉석 합성하므로 필수가 아니며, 이 캐시는
+  - live 모드에서 합성이 실패했을 때의 폴백
+  - --tts-mode cache (재생만, 합성 지연 0) 운용
+에 쓰인다. --check 는 setup_tts.sh 의 합성 스모크 테스트로도 사용된다.
 
 TTS 전용 venv의 python으로 실행하는 것을 권장한다:
   .venv-tts/bin/python prerender_tts.py --all

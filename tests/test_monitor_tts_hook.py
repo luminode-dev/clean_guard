@@ -6,7 +6,8 @@ ultralytics.YOLO를 스텁으로 대체하고 '사람이 파란 물체를 들고
 합성 영상(PNG 시퀀스)을 만들어 main()을 실행한다. 검증 대상:
   - 이벤트가 실제로 발화하는지
   - events.jsonl에 color 필드가 들어가는지 ('파란색')
-  - Announcer.announce가 (색상, 클래스)로 호출되는지
+  - Announcer.announce가 (색상, 클래스)로 호출되고 실시간 합성(NullBackend) -> 재생까지 가는지
+  - 야간 적외선/저조도 장면에서는 색상 없이(None) 방송하는지
 
   python3 tests/test_monitor_tts_hook.py
 """
@@ -25,9 +26,21 @@ sys.path.insert(0, str(ROOT))
 W, H = 320, 240
 N_FRAMES = 60
 DROP_BOX = [50, 100, 90, 140]            # 바닥에 놓인 폐기물
-BLUE = (220, 60, 30)                     # BGR
-BG = 128
 DROP_FRAME = 21                          # 이 프레임부터 바닥에 존재
+
+# 장면 스타일: (배경, 사람, 폐기물, 상단 띠) BGR
+STYLES = {
+    # 낮: 회색 바닥 + 파란 페트 + 위쪽에 색이 있는 벽/하늘 띠
+    "day":  dict(bg=(128, 128, 128), person=(200, 200, 200), waste=(220, 60, 30),
+                 band=(200, 170, 120)),
+    # 야간 적외선: 전 픽셀 B=G=R (흑백)
+    "ir":   dict(bg=(128, 128, 128), person=(200, 200, 200), waste=(60, 60, 60),
+                 band=(150, 150, 150)),
+    # 저조도: 전체가 어두움. 물체 자체는 파란색으로 판정될 만큼 밝아
+    # (색상 생략이 '야간' 판정 때문임을 확인) 배경 차분(MAD>0.05)도 통과한다
+    "dark": dict(bg=(20, 22, 20), person=(60, 60, 60), waste=(120, 40, 20),
+                 band=(30, 25, 20)),
+}
 
 fails = []
 
@@ -64,15 +77,18 @@ def scene(f):
     return pbox, None, False
 
 
-def render_frames(dirpath):
+def render_frames(dirpath, style):
+    st = STYLES[style]
     for f in range(1, N_FRAMES + 1):
-        img = np.full((H, W, 3), BG, np.uint8)
+        img = np.zeros((H, W, 3), np.uint8)
+        img[:] = st["bg"]
+        img[:24, :] = st["band"]
         pbox, wbox, _ = scene(f)
         x1, y1, x2, y2 = (int(v) for v in pbox)
-        cv2.rectangle(img, (max(0, x1), y1), (min(W, x2), y2), (200, 200, 200), -1)
+        cv2.rectangle(img, (max(0, x1), y1), (min(W, x2), y2), st["person"], -1)
         if wbox is not None:
             a, b, c, d = (int(v) for v in wbox)
-            cv2.rectangle(img, (max(0, a), b), (min(W, c), d), BLUE, -1)
+            cv2.rectangle(img, (max(0, a), b), (min(W, c), d), st["waste"], -1)
         cv2.imwrite(str(Path(dirpath) / f"frame_{f:04d}.png"), img)
 
 
@@ -133,55 +149,82 @@ sys.modules["ultralytics"] = fake
 import dump_monitor_jetson as dm                                   # noqa: E402
 from tts import Announcer                                          # noqa: E402
 
-print("1) 합성 영상 + 스텁 모델로 main() 실행")
 calls = []
+announcers = []
 _orig_announce = Announcer.announce
 
 
 def spy(self, color, waste_name):
     calls.append((color, waste_name))
+    announcers.append(self)
     return _orig_announce(self, color, waste_name)
 
 
 Announcer.announce = spy
 
-with tempfile.TemporaryDirectory() as td:
-    td = Path(td)
-    frames_dir = td / "frames"
+
+def run_scenario(td, style):
+    """합성 영상을 만들고 main()을 실행. (events, calls, announcer) 반환."""
+    calls.clear()
+    announcers.clear()
+    _Counter.f = 0
+    frames_dir = td / f"frames_{style}"
     frames_dir.mkdir()
-    render_frames(frames_dir)
+    render_frames(frames_dir, style)
     check("생성된 프레임 수", len(list(frames_dir.glob("*.png"))), N_FRAMES)
-
-    # 캐시를 NullBackend로 미리 채워 실시간 합성 없이 캐시 히트 경로를 타게 한다
-    from tts import PhraseCache, make_backend
-    cache = PhraseCache(td / "cache", make_backend("null"))
-    cache.prerender(["파란색"], ["페트"], verbose=False)
-
+    # 사전 렌더링 캐시 없이, 기본(live) 모드로 NullBackend 즉석 합성 경로를 탄다
     sys.argv = ["dump_monitor_jetson.py",
                 "--source", str(frames_dir / "frame_%04d.png"),
-                "--name", "ttshook", "--out", str(td / "out"),
+                "--name", style, "--out", str(td / "out"),
                 "--no-save-video", "--tts", "--tts-backend", "null",
-                "--tts-cache", str(td / "cache"),
+                "--tts-cache", str(td / "no_cache"),
                 "--tts-cooldown", "0", "--tts-repeat-window", "0"]
     dm.main()
-
-    print("\n2) 이벤트 기록")
-    ev_path = td / "out" / "ttshook" / "events.jsonl"
+    ev_path = td / "out" / style / "events.jsonl"
     check_true("events.jsonl 생성", ev_path.exists())
-    events = [json.loads(l) for l in ev_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+    events = [json.loads(l) for l in ev_path.read_text(encoding="utf-8").splitlines()
+              if l.strip()]
     check_true("이벤트 1건 이상", len(events) >= 1, f"{len(events)}건")
+    return events, list(calls), (announcers[0] if announcers else None)
+
+
+with tempfile.TemporaryDirectory() as td:
+    td = Path(td)
+
+    print("1) 낮 장면: 파란 페트 투기 -> 색상 포함 방송 (실시간 합성)")
+    events, got_calls, ann = run_scenario(td, "day")
     if events:
         ev = events[0]
         check("클래스", ev["class"], "페트")
         check("color 필드", ev["color"], "파란색")
+        check("night 필드", ev["night"], None)
         check("소지품 매칭으로 투기자 특정", ev["owner_matched"], True)
         check("투기자 pid", ev["owner_pid"], 1)
-        check_true("스냅샷 저장", (td / "out" / "ttshook" / "event_0001.jpg").exists())
+        check_true("스냅샷 저장", (td / "out" / "day" / "event_0001.jpg").exists())
+    check_true("announce 호출됨", len(got_calls) >= 1, f"{got_calls}")
+    if got_calls:
+        check("첫 방송 인자", got_calls[0], ("파란색", "페트"))
+    check_true("Announcer가 live 모드", ann is not None and ann.mode == "live")
+    if ann is not None:
+        check_true("즉석 합성 -> 재생까지 완료", ann.player.played >= 1,
+                   f"played={ann.player.played} synth_fail={ann.n_synth_fail}")
+        check("합성 실패 0건", ann.n_synth_fail, 0)
 
-    print("\n3) 방송 호출")
-    check_true("announce 호출됨", len(calls) >= 1, f"{calls}")
-    if calls:
-        check("첫 방송 인자", calls[0], ("파란색", "페트"))
+    print("\n2) 야간 적외선(흑백) 장면: 종류만 방송, 색상 None")
+    events, got_calls, ann = run_scenario(td, "ir")
+    if events:
+        check("color 필드", events[0]["color"], None)
+        check("night 필드", events[0]["night"], "적외선")
+    if got_calls:
+        check("방송 인자(색상 없음)", got_calls[0], (None, "페트"))
+
+    print("\n3) 저조도 장면: 종류만 방송, 색상 None")
+    events, got_calls, ann = run_scenario(td, "dark")
+    if events:
+        check("color 필드", events[0]["color"], None)
+        check("night 필드", events[0]["night"], "저조도")
+    if got_calls:
+        check("방송 인자(색상 없음)", got_calls[0], (None, "페트"))
 
 Announcer.announce = _orig_announce
 
