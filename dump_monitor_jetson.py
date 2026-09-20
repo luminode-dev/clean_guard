@@ -9,13 +9,15 @@
   야간 적외선/저조도 프레임에서는 색상 판정이 무의미하므로 종류만 방송한다
 - --mosaic head|face: 출력물(스냅샷/영상/화면)의 사람 얼굴을 픽셀화 (mosaic.py 참고).
   추론은 원본 프레임으로 하므로 탐지 정확도에는 영향 없음
+- --reid: 사람 재식별 (person_reid.py). 화면 밖으로 나갔다 돌아온 사람에게 이전 pid를 돌려줘
+  owner 부재 판정·회수 귀속이 끊기지 않게 한다. yolo26n-reid 임베딩, 사람당 3프레임마다 1회
 
 usage:
   python3 dump_monitor_jetson.py --source rtsp://... --name cam01
   python3 dump_monitor_jetson.py --source 0 --name webcam --show
   python3 dump_monitor_jetson.py --source clip.mp4 --name test --no-save-video
   python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-location "정문 수거함 앞"
-  python3 dump_monitor_jetson.py --source 0 --name cam01 --mosaic face
+  python3 dump_monitor_jetson.py --source 0 --name cam01 --mosaic face --reid
 """
 import argparse
 import json
@@ -28,6 +30,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from mosaic import FaceMosaic
+from person_reid import PersonReID, load_encoder as load_reid_encoder
 
 try:                                          # TTS는 선택 기능 — 없어도 감시는 동작
     from tts import Announcer, dominant_color_name
@@ -42,6 +45,7 @@ HERE = Path(__file__).parent
 
 WASTE_CONF = 0.20
 PERSON_CONF = 0.35
+TRACKER = "bytetrack.yaml"   # 명시 고정: ultralytics 버전별 기본 트래커가 달라 pid 특성이 흔들리는 것 방지
 STABLE_AGE = 12          # 폐기물이 '잔류'로 간주되는 누적 탐지 프레임
 MISS_TOLERANCE = 8       # 이 프레임까지는 ACTIVE 유지 (탐지 깜빡임 허용)
 LOST_KEEP = 300          # LOST 상태 보관 프레임 (재식별 대상)
@@ -239,6 +243,11 @@ def main():
     ap.add_argument("--raw-snapshot", action="store_true",
                     help="--mosaic 사용 시 모자이크 없는 원본 스냅샷도 event_NNNN_raw.jpg로 저장 "
                          "(증거 보관용. 접근 통제 필요)")
+    ap.add_argument("--reid", action="store_true",
+                    help="사람 재식별 활성화 (models/yolo26n-reid.engine|onnx 필요)")
+    ap.add_argument("--reid-model", default=None, help="Re-ID 모델 경로 (기본 models/yolo26n-reid.*)")
+    ap.add_argument("--reid-ttl", type=float, default=600.0,
+                    help="사라진 사람을 재식별 대상으로 기억하는 시간(초). 회수 판정 시간과 맞출 것")
     args = ap.parse_args()
 
     out_dir = Path(args.out) / args.name
@@ -257,6 +266,9 @@ def main():
                 location=args.tts_location, cooldown=args.tts_cooldown,
                 repeat_window=args.tts_repeat_window,
                 allow_runtime_synth=not args.tts_no_runtime_synth, **tts_kw)
+    reid = PersonReID(load_reid_encoder(args.reid_model) if args.reid else None, ttl_s=args.reid_ttl)
+    if args.reid and reid.enabled:
+        print(f"[ReID] 활성 · 갤러리 보관 {args.reid_ttl:.0f}s")
     mosaic = FaceMosaic(args.mosaic, model_path=args.face_model)
     if mosaic.enabled:
         print(f"[모자이크] {mosaic.mode} 모드"
@@ -292,13 +304,23 @@ def main():
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         pr = person_model.track(frame, classes=[0], conf=PERSON_CONF, persist=True,
-                                verbose=False)[0]
+                                tracker=TRACKER, verbose=False)[0]
         persons = []
         if pr.boxes is not None:
             ids = pr.boxes.id
             for k, b in enumerate(pr.boxes):
                 pid = int(ids[k]) if ids is not None else -(k + 1)
                 persons.append((pid, b.xyxy[0].tolist()))
+        # 재식별: 돌아온 사람에게 이전 pid를 돌려주고, 그동안 새 pid로 쌓인 상태를 옛 pid로 이관
+        persons, merges = reid.update(frame, persons, frame_idx)
+        for old_pid, new_pid in merges:
+            if old_pid in carried:
+                carried[new_pid] = carried.pop(old_pid)
+            for o in objects:
+                if o.owner_pid == old_pid:
+                    o.owner_pid = new_pid
+            for i, (fi, plist) in enumerate(person_hist):
+                person_hist[i] = (fi, [(new_pid if pid == old_pid else pid, pb) for pid, pb in plist])
         person_boxes = [p[1] for p in persons]
         person_hist.append((frame_idx, list(persons)))
         frame_buffer.append((frame_idx, frame_gray, list(persons)))
@@ -492,6 +514,8 @@ def main():
           f"이벤트 {n_events}건 -> {out_dir}")
     if mosaic.enabled:
         print(f"[{mosaic.summary()}]")
+    if reid.enabled:
+        print(f"[{reid.summary()}]")
     if announcer is not None:
         announcer.close()          # 큐에 남은 방송을 끝까지 재생한 뒤 종료
 

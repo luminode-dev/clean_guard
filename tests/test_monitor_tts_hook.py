@@ -9,6 +9,7 @@ ultralytics.YOLO를 스텁으로 대체하고 '사람이 파란 물체를 들고
   - Announcer.announce가 (색상, 클래스)로 호출되고 실시간 합성(NullBackend) -> 재생까지 가는지
   - 야간 적외선/저조도 장면에서는 색상 없이(None) 방송하는지
   - --mosaic head 로 스냅샷의 머리 영역이 가려지고, --raw-snapshot 원본은 그대로인지
+  - --reid: 투기자가 나갔다 새 트래커 id로 돌아오면 이전 pid로 재식별되는지 (가짜 임베더)
 
   python3 tests/test_monitor_tts_hook.py
 """
@@ -78,10 +79,13 @@ def scene(f):
     return pbox, None, False
 
 
-def render_frames(dirpath, style, textured_person=False):
+PERSON_TRACK = None     # 시나리오별 트래커 출력 오버라이드: f -> [(pid, box)] (None이면 pid 1 고정)
+
+
+def render_frames(dirpath, style, textured_person=False, n_frames=N_FRAMES):
     st = STYLES[style]
     rng = np.random.default_rng(0)
-    for f in range(1, N_FRAMES + 1):
+    for f in range(1, n_frames + 1):
         img = np.zeros((H, W, 3), np.uint8)
         img[:] = st["bg"]
         img[:24, :] = st["band"]
@@ -137,6 +141,9 @@ class FakeYOLO:
 
     def track(self, frame, **kw):
         _Counter.f += 1
+        if PERSON_TRACK is not None:
+            plist = PERSON_TRACK(_Counter.f)
+            return [_Result(_Boxes([_Box(b) for _, b in plist], ids=[pid for pid, _ in plist]))]
         pbox, _w, _c = scene(_Counter.f)
         return [_Result(_Boxes([_Box(pbox)], ids=[1]))]
 
@@ -171,7 +178,7 @@ def spy(self, color, waste_name):
 Announcer.announce = spy
 
 
-def run_scenario(td, style, name=None, extra_args=(), textured_person=False):
+def run_scenario(td, style, name=None, extra_args=(), textured_person=False, n_frames=N_FRAMES):
     """합성 영상을 만들고 main()을 실행. (events, calls, announcer) 반환."""
     name = name or style
     calls.clear()
@@ -179,8 +186,8 @@ def run_scenario(td, style, name=None, extra_args=(), textured_person=False):
     _Counter.f = 0
     frames_dir = td / f"frames_{name}"
     frames_dir.mkdir()
-    render_frames(frames_dir, style, textured_person=textured_person)
-    check("생성된 프레임 수", len(list(frames_dir.glob("*.png"))), N_FRAMES)
+    render_frames(frames_dir, style, textured_person=textured_person, n_frames=n_frames)
+    check("생성된 프레임 수", len(list(frames_dir.glob("*.png"))), n_frames)
     # 사전 렌더링 캐시 없이, 기본(live) 모드로 NullBackend 즉석 합성 경로를 탄다
     sys.argv = ["dump_monitor_jetson.py",
                 "--source", str(frames_dir / "frame_%04d.png"),
@@ -280,6 +287,60 @@ with tempfile.TemporaryDirectory() as td:
             body_r = raw[by1:int(pbox[3]), hx1:hx2]
             diff = np.abs(body_m.astype(np.int16) - body_r.astype(np.int16)).mean()
             check_true("몸통 영역은 두 스냅샷이 동일(JPEG 오차 이내)", diff < 3.0, f"평균차 {diff:.2f}")
+
+    print("\n5) --reid: 투기 후 나갔다가 새 트래커 id로 돌아온 사람 -> 이전 pid로 재식별")
+    from person_reid import PersonReID
+
+    class FakeEncoder:
+        """박스 폭을 정체성으로 쓰는 가짜 임베더 (같은 폭 = 같은 사람)."""
+        def __init__(self):
+            self.rng = np.random.default_rng(0)
+            self.base = {}
+
+        def __call__(self, frame, dets):
+            out = []
+            for cx, cy, w, h in dets:
+                k = int(round(w))
+                if k not in self.base:
+                    v = self.rng.normal(size=512)
+                    self.base[k] = v / np.linalg.norm(v)
+                v = self.base[k] + self.rng.normal(size=512) * 0.05
+                out.append(v / np.linalg.norm(v))
+            return out
+
+    RETURN_F = 70
+
+    def track_leave_and_return(f):
+        if f < 30:                                   # 접근·내려놓기 (pid 1)
+            return [(1, scene(f)[0])]
+        if f < RETURN_F:                             # 화면 밖 (트래커 출력 없음, 40프레임)
+            return []
+        return [(9, [95, 70, 145, 190])]             # 새 트래커 id 9로 물건 옆에 복귀 (폭 50 = 같은 사람)
+
+    merges_seen = []
+    _orig_update = PersonReID.update
+
+    def spy_update(self, frame, persons, frame_idx, now=None):
+        out, merges = _orig_update(self, frame, persons, frame_idx, now)
+        merges_seen.extend(merges)
+        return out, merges
+
+    PersonReID.update = spy_update
+    _orig_loader = dm.load_reid_encoder
+    dm.load_reid_encoder = lambda p=None, device=None: FakeEncoder()
+    PERSON_TRACK = track_leave_and_return
+    try:
+        events, got_calls, ann = run_scenario(td, "day", name="reid", extra_args=["--reid"],
+                                              n_frames=90)
+    finally:
+        PERSON_TRACK = None
+        PersonReID.update = _orig_update
+        dm.load_reid_encoder = _orig_loader
+    check_true("이벤트는 사람이 떠난 뒤 발화", bool(events) and 30 <= events[0]["frame"] < RETURN_F,
+               f"frame={events[0]['frame'] if events else None}")
+    if events:
+        check("투기자 pid", events[0]["owner_pid"], 1)
+    check("재식별 병합", merges_seen, [(9, 1)])
 
 Announcer.announce = _orig_announce
 

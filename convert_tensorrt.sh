@@ -7,6 +7,7 @@ readonly IMG_SIZE="${IMG_SIZE:-640}"
 readonly TRT_WORKSPACE_MB="${TRT_WORKSPACE_MB:-2048}"
 readonly TRTEXEC="${TRTEXEC:-/usr/src/tensorrt/bin/trtexec}"
 readonly MODELS=(waste10_yolo26n person_yolo26n)
+readonly REID_MODEL=yolo26n-reid          # 사람 재식별 임베더 (--reid). ONNX만 배포되므로 trtexec로 빌드
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
@@ -54,6 +55,28 @@ build_with_trtexec() {
   done
 }
 
+build_reid_with_trtexec() {
+  # 크롭 배치 크기가 프레임마다 달라지므로 동적 배치(1~16)로 빌드한다. 입력 224x224 고정.
+  local onnx="models/${REID_MODEL}.onnx"
+  local engine="models/${REID_MODEL}.engine"
+  if [[ ! -s "${onnx}" ]]; then
+    echo "skip: ${onnx} not found (Re-ID disabled unless downloaded; see README)" >&2
+    return 0
+  fi
+  if [[ ! -x "${TRTEXEC}" ]]; then
+    echo "skip: trtexec not found; ${REID_MODEL} will run from ONNX (slower)" >&2
+    return 0
+  fi
+  if ! "${TRTEXEC}" --onnx="${onnx}" --saveEngine="${engine}" \
+      --fp16 --memPoolSize="workspace:${TRT_WORKSPACE_MB}" \
+      --minShapes=images:1x3x224x224 --optShapes=images:4x3x224x224 --maxShapes=images:16x3x224x224; then
+    echo "warn: ${REID_MODEL} engine build failed; will fall back to ONNX at runtime" >&2
+    rm -f "${engine}"
+    return 0
+  fi
+  [[ -s "${engine}" ]] && echo "OK: ${engine}"
+}
+
 export IMG_SIZE TRT_WORKSPACE_MB
 if build_with_ultralytics; then
   :
@@ -61,8 +84,9 @@ else
   echo "Ultralytics export failed; falling back to trtexec ONNX build." >&2
   build_with_trtexec
 fi
+build_reid_with_trtexec
 
 for stem in "${MODELS[@]}"; do
   test -s "models/${stem}.engine" || die "engine verification failed: models/${stem}.engine"
 done
-echo "== Complete: both FP16 engines are ready =="
+echo "== Complete: detection engines ready (Re-ID engine optional, see above) =="

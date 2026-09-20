@@ -13,9 +13,11 @@ jetson_deploy/
 │   ├── person_yolo26n.onnx
 │   ├── *.engine                # ← Jetson 위에서 convert_tensorrt.sh 로 생성
 │   ├── face_detection_yunet_2023mar.onnx  # 안면 모자이크용 YuNet (230KB, --mosaic face)
+│   ├── yolo26n-reid.onnx       # 사람 재식별 임베더 (9.4MB, --reid). .engine은 convert_tensorrt.sh가 생성
 │   └── tts/supertonic-2/       # ← setup_tts.sh 가 내려받는 TTS 모델 (약 256MB)
 ├── dump_monitor_jetson.py      # 실행 모듈 (RTSP/웹캠/파일 입력)
 ├── mosaic.py                   # 사람 안면 모자이크 (OpenCV만 사용)
+├── person_reid.py              # 사람 재식별 (외형 임베딩 갤러리, 트래커 위에 얹음)
 ├── convert_tensorrt.sh         # TensorRT 변환 (Jetson에서 실행)
 ├── tts/                        # 음성 경고 방송 모듈 (아래 "음성 경고 방송" 참고)
 ├── setup_tts.sh                # TTS 환경 셋업 (venv + 모델 다운로드)
@@ -89,6 +91,43 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video
 - `event_NNNN.jpg` — 이벤트 증거 스냅샷 (빨간 박스 + 투기자 pid). `--mosaic` 시 얼굴 가려짐
 - `event_NNNN_raw.jpg` — `--mosaic --raw-snapshot` 일 때만: 얼굴을 가리지 않은 원본 스냅샷
 - `annotated.mp4` — 전체 주석 영상 (`--no-save-video`로 생략 가능). `--mosaic` 시 얼굴 가려짐
+
+## 사람 재식별 (`--reid`)
+
+사람 id는 트래커(ByteTrack, `TRACKER` 상수로 명시 고정)가 주는데, IoU+칼만 필터라 **화면 밖으로
+나갔다 돌아오면 새 id**가 된다. 투기자가 방송을 듣고 돌아와 봉투를 집어 가거나 잠깐 나갔다 오면
+`owner_pid`가 끊겨 "owner 부재" 판정과 회수 귀속이 틀어진다. `--reid`는 트래커 위에 외형 갤러리를
+얹어 **같은 사람이면 이전 id를 돌려준다** ([person_reid.py](person_reid.py)).
+
+```bash
+python3 dump_monitor_jetson.py --source 0 --name cam01 --reid
+```
+
+| 플래그 | 기본 | 의미 |
+|---|---|---|
+| `--reid` | off | 재식별 활성화 |
+| `--reid-model` | `models/yolo26n-reid.engine` → `.onnx` | 임베딩 모델. engine 무효 시 onnx 폴백, 둘 다 없으면 경고 후 비활성 |
+| `--reid-ttl` | 600 | 사라진 사람을 기억하는 시간(초). 대시보드의 회수 판정 시간과 맞춘다 |
+
+**동작**
+- 사람마다 `yolo26n-reid`(ultralytics 배포, 512차원) 임베딩을 **3프레임마다** 뽑아 트랙 전체에 걸쳐
+  지수이동평균한다. 한 프레임의 크롭들은 배치로 한 번에 추론
+- 새 트랙은 **5프레임 임베딩을 모아 평균**한 뒤 갤러리(30프레임 이상 안 보인 사람, TTL 이내)와 비교.
+  **유사도 ≥ 0.75 이고 2위와 차이 ≥ 0.05** 일 때만 병합 — 단일 프레임 비교는 노이즈가 커서
+  트랙 평균으로 판정한다 (부감 CCTV 보행자 11명 실측: 본인 0.79~0.92, 타인 최대 0.84)
+- 병합되면 `carried`·`owner_pid`·등장 이력의 새 id를 옛 id로 옮기고
+  `[ReID] P41 -> P21 재식별 (sim 0.86, 2위 0.57, 30프레임 만에 재등장)` 로그를 남긴다
+- 40px보다 작은 사람은 임베딩하지 않는다 (품질 낮음)
+
+**비용**: 사람당 3프레임마다 크롭 1장. PC CPU 기준 크롭당 45ms, 배치 7장 53ms. Orin Nano에서는
+TensorRT 엔진으로 수 ms 수준 예상 — `convert_tensorrt.sh`가 동적 배치(1~16)로 빌드한다.
+**보드에서 확인할 것**: `.engine` 로드 시 ultralytics `ReID`의 동적 배치 처리. 실패하면 로그에
+`사용 불가 -> 다음 포맷 시도`가 찍히고 `.onnx`로 돌아간다.
+
+**한계**
+- 같은 카메라 안에서만 동작한다. 장치 간·날짜 간 사람 연결은 하지 않는다 (개인정보 측면에서도 하지 않는 게 맞다)
+- 옷차림이 비슷한 사람끼리는 margin 규칙 때문에 병합을 보류한다 (놓치는 쪽이 오병합보다 안전)
+- 조명·각도가 크게 바뀌면(주간↔야간 IR) 유사도가 떨어져 새 사람으로 잡힌다
 
 ## 사람 안면 모자이크 (`--mosaic`)
 
@@ -203,8 +242,9 @@ python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-mode cache --
 ```bash
 python3 tests/test_color_naming.py      # 색상 판정 (모델 불필요)
 python3 tests/test_mosaic.py            # 픽셀화/머리영역/YuNet 폴백 (YOLO 불필요)
+python3 tests/test_person_reid.py       # 재식별 갤러리 규칙 (가짜 임베더, 모델 불필요)
 python3 tests/test_tts_offline.py       # 문구/실시간 합성/캐시/재생큐/쿨다운/폴백 (모델·스피커 불필요)
-python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조도/모자이크 발화→색상→방송 전 경로 (ultralytics 불필요)
+python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조도/모자이크/재식별 발화→색상→방송 전 경로 (ultralytics 불필요)
 .venv-tts/bin/python prerender_tts.py --check   # 실제 합성 + 스피커 재생
 ```
 
@@ -251,3 +291,9 @@ python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조
 
 - `--mosaic head|face`: 출력물의 사람 얼굴 픽셀화 (OpenCV YuNet, 추가 의존성 없음). 추론에는 영향 없음
 - `--raw-snapshot`: 원본 스냅샷 별도 보관 옵션
+
+### 사람 재식별 (2026-09-20)
+
+- `--reid`: 나갔다 돌아온 사람에게 이전 pid 복원 (yolo26n-reid 임베딩 갤러리, 트랙 평균 + margin 판정)
+- 트래커를 `bytetrack.yaml`로 명시 고정 (ultralytics 8.4의 기본이 tracktrack으로 바뀌어 있었음)
+- 보드 확인 필요: Re-ID `.engine` 동적 배치 로드, 실측 임베딩 지연
