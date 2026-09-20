@@ -21,6 +21,7 @@ usage:
 """
 import argparse
 import json
+import os
 import time
 from collections import deque
 from pathlib import Path
@@ -65,6 +66,38 @@ BG_MAD_THRESH = 0.05     # 영역 평균절대차(0~1)가 이보다 작으면 '�
 
 WASTE_NAMES = ["쓰레기봉투", "대형가구", "가전제품", "페트", "캔", "병",
                "스티로폼", "종이박스", "의류", "플라스틱"]
+
+
+ENV_FILE = Path(os.environ.get("CLEAN_GUARD_ENV") or (HERE / ".env"))
+
+
+def load_env_file(path=None):
+    """KEY=VALUE 설정 파일을 환경변수로 읽는다 (외부 의존성 없음).
+
+    RTSP 비밀번호를 명령줄에도 셸 이력에도 남기지 않으려면 여기에 적는다.
+    이미 설정된 환경변수는 덮어쓰지 않는다 — 명시적으로 넘긴 쪽이 항상 우선.
+    비밀번호가 들어가는 파일이므로 권한이 느슨하면 경고한다.
+    """
+    p = Path(path) if path else ENV_FILE
+    if not p.is_file():
+        return None
+    try:
+        if p.stat().st_mode & 0o077:
+            print(f"[설정 경고] {p.name}을 다른 사용자가 읽을 수 있습니다 -> chmod 600 {p}")
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            if k:
+                os.environ.setdefault(k, v)
+        return p
+    except OSError as e:                                         # noqa: BLE001
+        print(f"[설정 경고] {p}를 읽을 수 없음 ({e}) -> 무시하고 계속")
+        return None
 
 
 def load_model(stem_or_path: str):
@@ -235,9 +268,13 @@ class WasteObject:
 
 
 def main():
+    env_path = load_env_file()          # .env를 먼저 읽어 아래 기본값으로 쓴다
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", required=True, help="영상 파일 / RTSP URL / 웹캠 번호")
-    ap.add_argument("--name", default="cam", help="출력 폴더명")
+    ap.add_argument("--source", default=None,
+                    help="영상 파일 / RTSP URL / 웹캠 번호. 생략하면 .env 또는 환경변수의 "
+                         "CAM_URL을 쓴다 (비밀번호가 명령줄·ps·셸 이력에 남지 않는다)")
+    ap.add_argument("--name", default=os.environ.get("CAM_NAME") or "cam",
+                    help="출력 폴더명 (.env의 CAM_NAME)")
     ap.add_argument("--out", default=str(HERE / "output"), help="출력 루트")
     ap.add_argument("--waste-model", default=None)
     ap.add_argument("--person-model", default=None)
@@ -251,8 +288,9 @@ def main():
                     help="합성 백엔드 (null=무음, 배선 점검용)")
     ap.add_argument("--tts-cache", default=None,
                     help="사전 렌더링 wav 폴더 (기본 cache/tts). live 모드에선 합성 실패 시 폴백용")
-    ap.add_argument("--tts-location", default=None,
-                    help="방송에 넣을 장소명 (cache 모드면 그 장소 전용 캐시가 있어야 함)")
+    ap.add_argument("--tts-location", default=os.environ.get("CAM_LOCATION") or None,
+                    help="방송에 넣을 장소명 (.env의 CAM_LOCATION). "
+                         "cache 모드면 그 장소 전용 캐시가 있어야 함")
     ap.add_argument("--tts-cooldown", type=float, default=12.0,
                     help="방송 간 최소 간격(초). 문장 길이(약 9초)보다 크게 두어 대기열 적체를 막는다")
     ap.add_argument("--tts-repeat-window", type=float, default=30.0,
@@ -300,6 +338,17 @@ def main():
                     help="라이브 입력에서 밀린 프레임을 버리지 않는다. "
                          "전 프레임 분석이 필요한 검증용이며, 상시 운영에서는 지연이 누적된다")
     args = ap.parse_args()
+
+    if env_path is not None:
+        print(f"[설정] {env_path} 읽음")
+    # --source가 없으면 CAM_URL에서 읽는다. 명령줄에 두면 ps aux로 비밀번호가 보이고
+    # 셸 이력에도 남으므로, 자격증명이 들어간 RTSP URL은 이쪽을 쓰는 편이 안전하다.
+    if not args.source:
+        args.source = os.environ.get("CAM_URL", "").strip()
+        if not args.source:
+            ap.error(f"카메라 주소가 없습니다. {ENV_FILE}에 CAM_URL을 적거나 "
+                     f"--source로 넘기세요 (.env.example 참고)")
+        print("[입력] CAM_URL 사용")
 
     out_dir = Path(args.out) / args.name
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -12,6 +12,9 @@ cache/
 # TTS 전용 venv
 .venv-tts/
 
+# 카메라 설정 (RTSP 자격증명 포함). .env.example만 커밋한다
+.env
+
 # 실행 산출물
 output/
 

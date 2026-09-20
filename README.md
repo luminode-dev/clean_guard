@@ -4,23 +4,37 @@
 
 ## 빠른 실행
 
-셋업이 끝난 보드에서 **RTSP CCTV 상시 감시** (권장 구성):
+### 1. 카메라 설정 (최초 1회)
+
+RTSP 주소는 `.env` 파일에 적는다. **명령줄에 두지 말 것** — `ps aux`로 다른 사용자에게
+비밀번호가 보이고 셸 이력(`~/.bash_history`)에도 남는다.
+
+```bash
+cd ~/Desktop/cleangaurd/clean_guard
+cp .env.example .env
+nano .env            # CAM_URL / CAM_NAME / CAM_LOCATION 채우기
+chmod 600 .env       # 본인만 읽게 (권한이 느슨하면 실행 시 경고가 뜬다)
+```
+
+```ini
+CAM_URL=rtsp://아이디:비밀번호@192.168.0.10:554/stream
+CAM_NAME=cam01
+CAM_LOCATION=정문 수거함 앞
+```
+
+아이디·비밀번호에 `@ : / #` 이 들어가면 퍼센트 인코딩해야 한다 (`@`→`%40`, `:`→`%3A`).
+`.env`는 `.gitignore`에 있어 깃에 올라가지 않는다.
+
+### 2. 실행
 
 ```bash
 cd ~/Desktop/cleangaurd/clean_guard
 
-# 자격증명이 셸 이력에 남지 않도록 환경변수로 넘긴다
-export CAM_URL="rtsp://아이디:비밀번호@192.168.0.10:554/stream"
-
-python3 dump_monitor_jetson.py \
-  --source "$CAM_URL" \
-  --name cam01 \
-  --tts \
-  --tts-location "정문 수거함 앞" \
-  --mosaic face \
-  --reid \
-  --no-save-video
+python3 dump_monitor_jetson.py --tts --mosaic face --reid --no-save-video
 ```
+
+주소·이름·장소는 `.env`에서 자동으로 읽는다. 명령줄 인자를 주면 그쪽이 우선한다
+(`--source`, `--name`, `--tts-location`).
 
 | 옵션 | 왜 |
 |---|---|
@@ -33,7 +47,7 @@ python3 dump_monitor_jetson.py \
 재연결·프레임드롭·디스크 회수는 **전부 기본 동작**이라 따로 켤 필요가 없다. 최소 실행:
 
 ```bash
-python3 dump_monitor_jetson.py --source "$CAM_URL" --name cam01 --tts
+python3 dump_monitor_jetson.py --tts
 ```
 
 영상도 남기려면 `--no-save-video`를 빼고 보관량을 줄인다 (여유가 모자라면 오래된 것부터 자동 삭제):
@@ -52,6 +66,8 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video   #
 **정상 기동 로그** — 여기까지 나오면 감시 중이다:
 
 ```
+[설정] /home/gailab/Desktop/cleangaurd/clean_guard/.env 읽음
+[입력] CAM_URL 사용
 [TTS] 방송 활성 (실시간 합성, 백엔드=supertonic) · 재생=paplay · 위치='정문 수거함 앞'
 [ReID] 활성 · 갤러리 보관 600s
 [모자이크] face 모드
@@ -77,6 +93,7 @@ jetson_deploy/
 │   ├── face_detection_yunet_2023mar.onnx  # 안면 모자이크용 YuNet (230KB, --mosaic face)
 │   ├── yolo26n-reid.onnx       # 사람 재식별 임베더 (9.4MB, --reid). .engine은 convert_tensorrt.sh가 생성
 │   └── tts/supertonic-2/       # ← setup_tts.sh 가 내려받는 TTS 모델 (약 256MB)
+├── .env.example                # 카메라 설정 템플릿 → cp .env.example .env 로 복사해 사용
 ├── dump_monitor_jetson.py      # 실행 모듈 (RTSP/웹캠/파일 입력)
 ├── stream.py                   # 입력 스트림 (RTSP 자동 재연결 + 최신 프레임 유지)
 ├── recorder.py                 # 주석 영상 회전 기록 + 디스크 FIFO 회수
