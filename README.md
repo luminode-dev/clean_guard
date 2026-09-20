@@ -90,7 +90,66 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video
 - `events.jsonl` — 이벤트 로그 (시각, 클래스, **색상**, **night**(`"적외선"`/`"저조도"`/null), conf, 객체 id, 투기자 pid, bbox). append 방식이라 재시작해도 이어짐
 - `event_NNNN.jpg` — 이벤트 증거 스냅샷 (빨간 박스 + 투기자 pid). `--mosaic` 시 얼굴 가려짐
 - `event_NNNN_raw.jpg` — `--mosaic --raw-snapshot` 일 때만: 얼굴을 가리지 않은 원본 스냅샷
-- `annotated.mp4` — 전체 주석 영상 (`--no-save-video`로 생략 가능). `--mosaic` 시 얼굴 가려짐
+- `annotated_YYYYmmdd_HHMMSS.mp4` — 주석 영상. **시간 단위로 분할**되고 오래된 것부터 삭제된다
+  (`--no-save-video`로 생략 가능). `--mosaic` 시 얼굴 가려짐. 아래 "상시 운영" 참고
+
+## 상시 운영 (RTSP 24/7)
+
+유한한 영상 클립과 달리 상시 스트림에는 세 가지 함정이 있다. 기본값이 이미 상시 운영에
+맞춰져 있으므로 보통은 아무 옵션도 주지 않아도 된다 ([stream.py](stream.py), [recorder.py](recorder.py)).
+
+**1) 스트림 끊김 — 자동 재연결.** 네트워크 순단으로 `cap.read()`가 실패하면 지수 백오프
+(2s → 4s → … → 30s)로 무한 재연결한다. 재연결 횟수는 종료 시 요약에 찍힌다.
+첫 연결만은 `startup_timeout`(30s) 안에 실패하면 바로 오류를 낸다 — URL 오타를 몇 초 안에
+알려주기 위해서다.
+
+**2) 지연 누적 — 밀린 프레임 드롭.** 추론이 스트림보다 느리면 OpenCV 내부 버퍼에 프레임이
+쌓여 처리 시점이 실시간에서 계속 뒤처진다. 방치하면 "방금 버린 사람"에게 몇 분 전 사건을
+방송하게 되어 경고 방송의 의미가 사라진다. 라이브 입력에서는 읽기 스레드가 **항상 최신
+프레임만** 들고 있고 그 사이 도착한 것은 버린다. 파일 입력은 전 프레임을 순차 처리한다
+(자동 판별 — `rtsp://`/`http://`/웹캠 번호 = 라이브).
+
+**3) 디스크 고갈 — 분할·보존·FIFO 회수.** 1080p `mp4v`는 시간당 수 GB다. 주석 영상을
+시간 단위로 나누고 최신 N개만 남긴다. 그것만으로 모자라면 **여유 공간을 기준으로 오래된
+출력물부터 삭제**하고(FIFO), 그래도 안 되면 녹화를 멈춘다 (`events.jsonl`은 어떤 경우에도
+지우지 않는다 — 용량이 작고 그것이 곧 이벤트 기록이다).
+
+**해상도 분리**: 분석은 원본 해상도(1080p)로 하고, **이벤트 스냅샷만 640px 폭으로 줄여
+저장**한다(`--snapshot-width`, 기본 640). 탐지·색상 판정·재식별은 모두 원본 프레임으로
+끝난 뒤에 저장하므로 정확도에는 영향이 없고, 스냅샷 용량만 10배 이상 줄어든다.
+박스와 라벨은 축소 후에 그리므로 640에서도 선명하다.
+
+| 플래그 | 기본 | 의미 |
+|---|---|---|
+| `--video-segment-min` | 60 | 주석 영상 분할 단위(분) |
+| `--video-keep` | 24 | 보관할 세그먼트 개수. 초과분은 오래된 것부터 삭제 (기본값 = 24시간분) |
+| `--min-free-mb` | 1000 | 여유가 이 값 미만이면 오래된 출력물부터 삭제, 그래도 모자라면 녹화 중단 |
+| `--purge-order` | `video-first` | 회수 순서. `video-first`=영상을 먼저 다 비우고 그래도 모자라면 스냅샷(각각 오래된 것부터) / `oldest-first`=종류 무관 순수 FIFO |
+| `--snapshot-width` | 640 | 이벤트 스냅샷 저장 폭(px). `0`=원본 그대로 |
+| `--reconnect-delay` | 2.0 | 첫 재연결 대기(초). 실패할수록 2배씩 증가 |
+| `--reconnect-max-delay` | 30.0 | 재연결 대기 상한(초) |
+| `--reconnect-max-retries` | 0 | 재연결 최대 시도. 0=무한 |
+| `--no-drop-frames` | off | 라이브에서도 전 프레임 처리 (검증용. 상시 운영에서는 지연이 누적된다) |
+
+기본 `video-first`는 증거(스냅샷)보다 영상을 먼저 버린다. 순수하게 들어온 순서대로
+지우려면 `--purge-order oldest-first`를 쓴다 — 이 경우 오래된 증거 스냅샷이 최신 영상보다
+먼저 삭제될 수 있다.
+
+**탐지 모델 입력은 640 고정이다.** `models/*.engine`이 `(1,3,640,640)` 고정 형상으로
+빌드돼 있어, 1080p 프레임은 추론 직전에 640으로 레터박싱된다(프레임 자체는 1080p로 남아
+추적·색상·모자이크·증거에 그대로 쓰인다). 탐지 입력까지 키우려면 엔진 재빌드가 필요하다:
+`IMG_SIZE=1088 ./convert_tensorrt.sh` — 연산량이 약 3배로 늘어 Orin Nano에서는 실시간
+처리가 어려울 수 있으니 FPS를 보고 판단할 것.
+
+종료 시 `[스트림: N프레임 수신 · 재연결 M회 · 지연분 K프레임 드롭]`과
+`[녹화: 세그먼트 N개 생성 · … · 보관 M개(XMB)]`가 출력된다. 드롭 비율이 높으면 추론이
+스트림을 못 따라가는 것이므로 `--no-save-video`, `--mosaic head`, 추론 프레임 스킵 순으로 줄인다.
+
+**디스크 여유가 빠듯하면 영상을 아예 끄는 게 안전하다** — 증거는 스냅샷과 `events.jsonl`에 남는다:
+
+```bash
+python3 dump_monitor_jetson.py --source "$CAM_URL" --name cam01 --tts --no-save-video
+```
 
 ## 사람 재식별 (`--reid`)
 
@@ -245,6 +304,7 @@ python3 tests/test_mosaic.py            # 픽셀화/머리영역/YuNet 폴백 (Y
 python3 tests/test_person_reid.py       # 재식별 갤러리 규칙 (가짜 임베더, 모델 불필요)
 python3 tests/test_tts_offline.py       # 문구/실시간 합성/캐시/재생큐/쿨다운/폴백 (모델·스피커 불필요)
 python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조도/모자이크/재식별 발화→색상→방송 전 경로 (ultralytics 불필요)
+python3 tests/test_stream_recorder.py   # 입력 종류 판정/파일 EOF/영상 분할·보존·디스크 가드 (카메라·네트워크 불필요)
 .venv-tts/bin/python prerender_tts.py --check   # 실제 합성 + 스피커 재생
 ```
 

@@ -31,6 +31,8 @@ from ultralytics import YOLO
 
 from mosaic import FaceMosaic
 from person_reid import PersonReID, load_encoder as load_reid_encoder
+from recorder import OutputSpace, RotatingRecorder
+from stream import FrameSource
 
 try:                                          # TTS는 선택 기능 — 없어도 감시는 동작
     from tts import Announcer, dominant_color_name
@@ -157,6 +159,30 @@ def person_near(obj_box, person_boxes, factor=NEAR_FACTOR):
     return False
 
 
+def save_snapshot(path, image, box, label, width=0):
+    """증거 스냅샷 저장. width>0이고 원본이 더 크면 그 폭으로 줄여서 쓴다.
+
+    축소를 먼저 하고 박스·라벨을 그린다. 원본에 그린 뒤 줄이면 선과 글자가 같이
+    작아져 640에서 잘 안 보이기 때문이다. 박스 좌표는 축소 비율로 환산한다.
+    분석·색상 판정은 원본 해상도로 이미 끝난 뒤이므로 정확도에는 영향이 없다.
+    """
+    s = 1.0
+    if width and image.shape[1] > width:
+        s = width / float(image.shape[1])
+        img = cv2.resize(image, (int(width), max(1, int(round(image.shape[0] * s)))),
+                         interpolation=cv2.INTER_AREA)
+    else:
+        img = image.copy()
+    w = img.shape[1]
+    th = max(1, int(round(w / 320)))                 # 폭에 비례한 선 두께
+    fs = max(0.4, w / 1100.0)                        # 폭에 비례한 글자 크기
+    x1, y1, x2, y2 = [int(round(v * s)) for v in box]
+    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), th)
+    cv2.putText(img, label, (int(w * 0.02), int(round(28 * fs / 0.58))),
+                cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), th)
+    return cv2.imwrite(str(path), img)
+
+
 def best_color_crop(frame, box):
     """색상 판정용 64x64 크롭 사본. TTS 모듈이 없으면 None."""
     if crop_box is None:
@@ -248,6 +274,31 @@ def main():
     ap.add_argument("--reid-model", default=None, help="Re-ID 모델 경로 (기본 models/yolo26n-reid.*)")
     ap.add_argument("--reid-ttl", type=float, default=600.0,
                     help="사라진 사람을 재식별 대상으로 기억하는 시간(초). 회수 판정 시간과 맞출 것")
+    # --- 상시 운영(RTSP) 관련 ---
+    ap.add_argument("--video-segment-min", type=float, default=60.0,
+                    help="주석 영상을 이 분 단위로 분할 (기본 60). 상시 운영에서 디스크 고갈 방지")
+    ap.add_argument("--video-keep", type=int, default=24,
+                    help="보관할 영상 세그먼트 개수. 초과분은 오래된 것부터 삭제 (기본 24)")
+    ap.add_argument("--min-free-mb", type=float, default=1000.0,
+                    help="여유 디스크가 이 값 아래면 오래된 출력물부터 삭제하고, "
+                         "그래도 모자라면 녹화를 중단한다 (기본 1000MB)")
+    ap.add_argument("--purge-order", default="video-first",
+                    choices=["video-first", "oldest-first"],
+                    help="공간 회수 순서. video-first=주석 영상을 먼저 다 지우고 "
+                         "그래도 모자라면 스냅샷(각각 오래된 것부터) / "
+                         "oldest-first=종류 무관 순수 FIFO")
+    ap.add_argument("--snapshot-width", type=int, default=640,
+                    help="이벤트 스냅샷 저장 폭(px). 0=원본 그대로. 기본 640 "
+                         "(분석은 원본 해상도로 하고 저장만 줄인다)")
+    ap.add_argument("--reconnect-delay", type=float, default=2.0,
+                    help="스트림 끊김 후 첫 재연결 대기(초). 실패할수록 2배씩 늘어난다")
+    ap.add_argument("--reconnect-max-delay", type=float, default=30.0,
+                    help="재연결 대기 상한(초)")
+    ap.add_argument("--reconnect-max-retries", type=int, default=0,
+                    help="재연결 최대 시도 횟수. 0=무한 (상시 감시 기본값)")
+    ap.add_argument("--no-drop-frames", action="store_true",
+                    help="라이브 입력에서 밀린 프레임을 버리지 않는다. "
+                         "전 프레임 분석이 필요한 검증용이며, 상시 운영에서는 지연이 누적된다")
     args = ap.parse_args()
 
     out_dir = Path(args.out) / args.name
@@ -277,17 +328,36 @@ def main():
     person_model, person_path = load_model(args.person_model or "person_yolo26n")
     print(f"waste={Path(waste_path).name} person={Path(person_path).name} -> {out_dir}")
 
-    cap = cv2.VideoCapture(int(args.source) if args.source.isdigit() else args.source)
-    if not cap.isOpened():
-        print(f"입력을 열 수 없음: {args.source}")
+    try:
+        src = FrameSource(args.source,
+                          reconnect_delay=args.reconnect_delay,
+                          reconnect_max_delay=args.reconnect_max_delay,
+                          reconnect_max_retries=args.reconnect_max_retries,
+                          drop_stale=not args.no_drop_frames).open()
+    except RuntimeError as e:
+        print(e)
         return
-    fps = cap.get(cv2.CAP_PROP_FPS) or 10
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = None
-    if not args.no_save_video:
-        writer = cv2.VideoWriter(str(out_dir / "annotated.mp4"),
-                                 cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+    fps, W, H = src.fps, src.width, src.height
+    if src.live:
+        print(f"[스트림] 라이브 입력 {W}x{H} @{fps:.0f}fps · "
+              + ("밀린 프레임 드롭" if src.drop_stale else "전 프레임 처리")
+              + (" · 재연결 무한" if not args.reconnect_max_retries
+                 else f" · 재연결 최대 {args.reconnect_max_retries}회"))
+    recorder = RotatingRecorder(out_dir, fps, (W, H),
+                                segment_min=args.video_segment_min,
+                                keep=args.video_keep,
+                                min_free_mb=args.min_free_mb,
+                                enabled=not args.no_save_video)
+    if recorder.enabled:
+        seg = (f"{recorder.segment_sec / 60:.0f}분" if recorder.segment_sec >= 60
+               else f"{recorder.segment_sec:.0f}초")
+        print(f"[녹화] {seg} 단위 분할 · 최신 {args.video_keep}개 보관 "
+              f"· 여유 {args.min_free_mb:.0f}MB 미만이면 중단")
+    space = OutputSpace(out_dir, min_free_mb=args.min_free_mb,
+                        purge_order=args.purge_order)
+    print(f"[디스크] 여유 {space.free_mb():.0f}MB · 임계 {args.min_free_mb:.0f}MB "
+          f"· 회수 순서 {args.purge_order} · 스냅샷 "
+          + (f"{args.snapshot_width}px 폭" if args.snapshot_width else "원본 해상도"))
     events_f = open(out_dir / "events.jsonl", "a", encoding="utf-8")
 
     objects, carried = [], {}
@@ -297,9 +367,15 @@ def main():
     t0 = time.time()
 
     while True:
-        ok, frame = cap.read()
+        ok, frame = src.read()
         if not ok:
-            break
+            break                       # 파일 EOF 또는 재연결 포기
+        if frame is None:
+            # 연결은 살아 있는데 이번 주기에 새 프레임이 없었다 (일시적 정체).
+            # --show의 종료 입력만 처리하고 넘어간다.
+            if args.show and cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+            continue
         frame_idx += 1
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -395,6 +471,14 @@ def main():
                 o.owner_pid, o.owner_strong, o.person_at_birth = best_pid, True, True
             objects.append(o)
         objects = [o for o in objects if frame_idx - o.last_seen <= LOST_KEEP]
+        # 소지품 기록도 같은 기준으로 정리한다. 위 귀속 탐색이 carried 전체를 훑으므로
+        # 안 지우면 상시 운영에서 누적된 pid만큼 매 탐지마다 느려진다.
+        # (CARRY_WINDOW 초과분은 어차피 귀속 후보에서 제외되므로 판정 결과는 그대로)
+        if frame_idx % 300 == 0:
+            carried = {pid: info for pid, info in carried.items()
+                       if frame_idx - info["last_frame"] <= CARRY_WINDOW}
+            # 녹화가 꺼져 있어도 스냅샷은 쌓이므로 주기적으로 공간을 본다
+            space.reclaim(exclude=recorder.current_path())
 
         # 추론·색상 크롭·재식별이 모두 끝난 뒤, 출력(스냅샷/영상/화면)에 쓰일 프레임의 얼굴을 가린다.
         # raw는 원본 스냅샷 저장과 색상 판정 폴백(best_crop 없을 때)에만 쓴다.
@@ -465,19 +549,15 @@ def main():
                   f"{'(소지품 매칭)' if o.owner_strong else ''}", flush=True)
             if announcer is not None:
                 announcer.announce(color, WASTE_NAMES[o.cls])
-            x1, y1, x2, y2 = map(int, o.box)
             label = f"DUMPING SUSPECT #{n_events} (person {o.owner_pid})"
-            snap = frame.copy()
-            cv2.rectangle(snap, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            cv2.putText(snap, label, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
-            cv2.imwrite(str(out_dir / f"event_{n_events:04d}.jpg"), snap)
+            space.reclaim(exclude=recorder.current_path())   # 쓰기 전에 자리 확보
+            save_snapshot(out_dir / f"event_{n_events:04d}.jpg", frame, o.box,
+                          label, args.snapshot_width)
             if mosaic.enabled and args.raw_snapshot:
-                snap = raw.copy()
-                cv2.rectangle(snap, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                cv2.putText(snap, label, (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 255), 3)
-                cv2.imwrite(str(out_dir / f"event_{n_events:04d}_raw.jpg"), snap)
+                save_snapshot(out_dir / f"event_{n_events:04d}_raw.jpg", raw, o.box,
+                              label, args.snapshot_width)
 
-        if writer is not None or args.show:
+        if recorder.enabled or args.show:
             for pid, p in persons:
                 x1, y1, x2, y2 = map(int, p)
                 has_carry = pid in carried and frame_idx - carried[pid]["last_frame"] <= 5
@@ -498,20 +578,22 @@ def main():
             if n_events:
                 cv2.putText(frame, f"EVENTS: {n_events}", (30, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-            if writer is not None:
-                writer.write(frame)
+            recorder.write(frame)
             if args.show:
                 cv2.imshow("dump_monitor", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
 
     dt = time.time() - t0          # 방송 잔여 재생 대기 전에 측정 (FPS 왜곡 방지)
-    cap.release()
-    if writer is not None:
-        writer.release()
+    src.close()
+    recorder.close()
     events_f.close()
     print(f"완료: {frame_idx}프레임, {dt:.1f}s ({frame_idx / max(dt, 0.1):.1f} FPS), "
           f"이벤트 {n_events}건 -> {out_dir}")
+    print(f"[{src.summary()}]")
+    if recorder.enabled:
+        print(f"[{recorder.summary()}]")
+    print(f"[{space.summary()}]")
     if mosaic.enabled:
         print(f"[{mosaic.summary()}]")
     if reid.enabled:

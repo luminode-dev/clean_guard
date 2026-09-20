@@ -1,5 +1,7 @@
 # TensorRT 엔진 — 빌드한 GPU/JetPack 전용이므로 보드에서 생성
-models/*.engine
+# (하위 폴더까지 덮도록 **/ 사용: 재빌드 전 백업 등)
+models/**/*.engine
+models/_engine_backup/
 
 # TTS 모델 가중치 (setup_tts.sh가 HuggingFace에서 내려받음, 수백 MB)
 models/tts/

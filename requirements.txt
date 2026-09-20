@@ -2,9 +2,13 @@
 # 주의: torch/torchvision은 pip 기본 wheel이 아니라 NVIDIA Jetson용 wheel을 설치할 것
 #   https://docs.ultralytics.com/guides/nvidia-jetson/ 참고
 ultralytics>=8.4
-opencv-python>=4.8        # JetPack 기본 OpenCV 사용 시 생략 가능
 lap>=0.5.12               # ByteTrack 의존성
-numpy
+numpy<2                   # JetPack cv2가 numpy 1.x ABI로 빌드됨. 2.x면 cv2가 깨진다
+
+# opencv-python>=4.8      # Jetson에서는 설치하지 말 것
+#   pip 배포판은 GStreamer 없이(FFMPEG only) 빌드돼 있어, 설치하면 JetPack 기본
+#   cv2(4.8.0, GStreamer 1.20.3)를 가려 RTSP가 소프트웨어 디코딩으로 떨어진다.
+#   ultralytics가 의존성으로 끌어오므로 설치 후 `pip uninstall opencv-python` 필요.
 
 # --- TTS 방송(--tts) 의존성은 여기에 넣지 말 것 ---
 # onnxruntime이 numpy 2.x를 끌어오는데 JetPack 기본 cv2는 numpy 1.x로 빌드되어 있어
