@@ -2,6 +2,68 @@
 
 폐기물 10클래스 탐지 + 사람 추적 + 투기 이벤트 감지를 Jetson에서 TensorRT로 구동하기 위한 패키지.
 
+## 빠른 실행
+
+셋업이 끝난 보드에서 **RTSP CCTV 상시 감시** (권장 구성):
+
+```bash
+cd ~/Desktop/cleangaurd/clean_guard
+
+# 자격증명이 셸 이력에 남지 않도록 환경변수로 넘긴다
+export CAM_URL="rtsp://아이디:비밀번호@192.168.0.10:554/stream"
+
+python3 dump_monitor_jetson.py \
+  --source "$CAM_URL" \
+  --name cam01 \
+  --tts \
+  --tts-location "정문 수거함 앞" \
+  --mosaic face \
+  --reid \
+  --no-save-video
+```
+
+| 옵션 | 왜 |
+|---|---|
+| `--tts` | 투기 발화 시 현장 스피커로 한국어 경고 방송 (온디바이스 합성) |
+| `--tts-location` | 방송 문구에 장소명 삽입 ("정문 수거함 앞에 파란색 페트병을…") |
+| `--mosaic face` | 출력물의 얼굴 픽셀화. 추론은 원본으로 하므로 정확도 영향 없음 |
+| `--reid` | 나갔다 돌아온 사람에게 이전 pid 복원 — owner 부재 판정이 끊기지 않는다 |
+| `--no-save-video` | 주석 영상 생략. **디스크가 빠듯하면 필수** (1080p 기준 시간당 수 GB) |
+
+재연결·프레임드롭·디스크 회수는 **전부 기본 동작**이라 따로 켤 필요가 없다. 최소 실행:
+
+```bash
+python3 dump_monitor_jetson.py --source "$CAM_URL" --name cam01 --tts
+```
+
+영상도 남기려면 `--no-save-video`를 빼고 보관량을 줄인다 (여유가 모자라면 오래된 것부터 자동 삭제):
+
+```bash
+  --video-segment-min 10 --video-keep 3 --min-free-mb 800
+```
+
+기타 입력:
+
+```bash
+python3 dump_monitor_jetson.py --source 0 --name webcam --show        # USB 웹캠 + 화면
+python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video   # 영상 파일
+```
+
+**정상 기동 로그** — 여기까지 나오면 감시 중이다:
+
+```
+[TTS] 방송 활성 (실시간 합성, 백엔드=supertonic) · 재생=paplay · 위치='정문 수거함 앞'
+[ReID] 활성 · 갤러리 보관 600s
+[모자이크] face 모드
+waste=waste10_yolo26n.engine person=person_yolo26n.engine -> output/cam01
+[스트림] 라이브 입력 1920x1080 @15fps · 밀린 프레임 드롭 · 재연결 무한
+[디스크] 여유 1800MB · 임계 1000MB · 회수 순서 video-first · 스냅샷 640px 폭
+[TTS] 합성 워커 준비 완료 (N.Ns)
+```
+
+결과는 `output/cam01/`에 쌓인다 (`events.jsonl`, `event_NNNN.jpg`). 상세는 아래
+"출력", "상시 운영 (RTSP 24/7)" 참고. 처음 셋업하는 보드라면 "설치"부터 읽을 것.
+
 ## 폴더 구성
 
 ```
@@ -16,6 +78,8 @@ jetson_deploy/
 │   ├── yolo26n-reid.onnx       # 사람 재식별 임베더 (9.4MB, --reid). .engine은 convert_tensorrt.sh가 생성
 │   └── tts/supertonic-2/       # ← setup_tts.sh 가 내려받는 TTS 모델 (약 256MB)
 ├── dump_monitor_jetson.py      # 실행 모듈 (RTSP/웹캠/파일 입력)
+├── stream.py                   # 입력 스트림 (RTSP 자동 재연결 + 최신 프레임 유지)
+├── recorder.py                 # 주석 영상 회전 기록 + 디스크 FIFO 회수
 ├── mosaic.py                   # 사람 안면 모자이크 (OpenCV만 사용)
 ├── person_reid.py              # 사람 재식별 (외형 임베딩 갤러리, 트래커 위에 얹음)
 ├── convert_tensorrt.sh         # TensorRT 변환 (Jetson에서 실행)
