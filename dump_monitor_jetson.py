@@ -3,6 +3,8 @@
 
 - 사람: COCO yolo26n (class 0) + ByteTrack / 폐기물: waste10 10클래스
 - 모델은 models/ 폴더에서 .engine(TensorRT) > .onnx > .pt 순으로 자동 선택
+- --backend ultralytics(기본) | trt: trt는 torch/ultralytics 없이 TensorRT(.engine)·onnxruntime(.onnx)을
+  직접 호출 (trt_backend.py + bytetrack.py). 메모리 ~1GB 절약, 시작 빠름. .pt 폴백은 없음
 - 로직: 소지품-사람 귀속, LOST 객체 재식별(Re-ID), owner 이탈 시 발화
   (개발 PC의 work/scripts/dump_monitor.py v2와 동일 로직)
 - --tts: 발화 시 '색상 + 쓰레기 종류'를 특정한 한국어 경고를 그 자리에서 합성해 방송 (tts/ 참고)
@@ -27,7 +29,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
 
 from mosaic import FaceMosaic
 from person_reid import PersonReID, load_encoder as load_reid_encoder
@@ -66,9 +67,10 @@ WASTE_NAMES = ["쓰레기봉투", "대형가구", "가전제품", "페트", "캔
 
 
 def load_model(stem_or_path: str):
-    """모델 로드. 경로가 주어지면 그대로, 아니면 models/에서
+    """(ultralytics 백엔드) 모델 로드. 경로가 주어지면 그대로, 아니면 models/에서
     .engine > .onnx > .pt 순으로 시도한다. 로드/워밉업이 실패하면 다음 포맷으로 폴백
     (예: JetPack 업그레이드로 .engine이 무효화된 경우 .onnx/.pt로 계속 동작)."""
+    from ultralytics import YOLO          # torch를 끌어오므로 이 백엔드를 쓸 때만 import
     if stem_or_path and Path(stem_or_path).suffix:
         return YOLO(stem_or_path), stem_or_path
     cands = [HERE / "models" / (stem_or_path + ext) for ext in (".engine", ".onnx", ".pt")]
@@ -84,6 +86,70 @@ def load_model(stem_or_path: str):
         except Exception as e:
             print(f"[경고] {p.name} 사용 불가 ({type(e).__name__}: {str(e)[:120]}) -> 다음 포맷 시도")
     raise RuntimeError(f"{stem_or_path}: 사용 가능한 모델 포맷이 없음")
+
+
+class UltralyticsBackend:
+    """ultralytics YOLO + 내장 ByteTrack. .engine/.onnx/.pt 모두 지원 (torch 상주)."""
+
+    name = "ultralytics"
+
+    def __init__(self, waste, person):
+        self.waste, self.waste_path = load_model(waste or "waste10_yolo26n")
+        self.person, self.person_path = load_model(person or "person_yolo26n")
+
+    def track_persons(self, frame):
+        pr = self.person.track(frame, classes=[0], conf=PERSON_CONF, persist=True,
+                               tracker=TRACKER, verbose=False)[0]
+        persons = []
+        if pr.boxes is not None:
+            ids = pr.boxes.id
+            for k, b in enumerate(pr.boxes):
+                pid = int(ids[k]) if ids is not None else -(k + 1)
+                persons.append((pid, b.xyxy[0].tolist()))
+        return persons
+
+    def detect_waste(self, frame):
+        wr = self.waste.predict(frame, conf=WASTE_CONF, verbose=False)[0]
+        if wr.boxes is None:
+            return []
+        return [(b.xyxy[0].tolist(), int(b.cls), float(b.conf)) for b in wr.boxes]
+
+    def reid_encoder(self, model_path):
+        return load_reid_encoder(model_path)
+
+
+class TrtBackend:
+    """torch 없는 백엔드: TensorRT(.engine) / onnxruntime(.onnx) 직접 호출 + 독립 ByteTrack."""
+
+    name = "trt"
+
+    def __init__(self, waste, person):
+        from trt_backend import ByteTrack, load_detector
+        self.waste, self.waste_path = load_detector(waste or "waste10_yolo26n")
+        self.person, self.person_path = load_detector(person or "person_yolo26n")
+        self.tracker = ByteTrack(frame_rate=30)     # ultralytics도 frame_rate=30 고정 (buffer 30프레임)
+
+    def track_persons(self, frame):
+        boxes, conf, _ = self.person.detect(frame, conf=PERSON_CONF, classes=[0])
+        return [(tid, box) for tid, box, _s in self.tracker.update(np.c_[boxes, conf])]
+
+    def detect_waste(self, frame):
+        boxes, conf, cls = self.waste.detect(frame, conf=WASTE_CONF)
+        return [(b.tolist(), int(c), float(s)) for b, c, s in zip(boxes, cls, conf)]
+
+    def reid_encoder(self, model_path):
+        from trt_backend import load_reid
+        try:
+            enc, path = load_reid(model_path or "yolo26n-reid")
+            print(f"[ReID] 인코더 로드: {Path(path).name} ({self.name})")
+            return enc
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[ReID 경고] {type(e).__name__}: {str(e)[:120]} -> 재식별 비활성")
+            return None
+
+
+def make_backend(name, waste, person):
+    return (TrtBackend if name == "trt" else UltralyticsBackend)(waste, person)
 
 
 def iou(a, b):
@@ -213,6 +279,9 @@ def main():
     ap.add_argument("--source", required=True, help="영상 파일 / RTSP URL / 웹캠 번호")
     ap.add_argument("--name", default="cam", help="출력 폴더명")
     ap.add_argument("--out", default=str(HERE / "output"), help="출력 루트")
+    ap.add_argument("--backend", default="ultralytics", choices=["ultralytics", "trt"],
+                    help="ultralytics=YOLO+내장 트래커(.engine/.onnx/.pt, torch 상주) / "
+                         "trt=torch 없이 TensorRT·onnxruntime 직접 호출 (.engine/.onnx)")
     ap.add_argument("--waste-model", default=None)
     ap.add_argument("--person-model", default=None)
     ap.add_argument("--show", action="store_true", help="화면 표시 (모니터 연결 시)")
@@ -266,16 +335,16 @@ def main():
                 location=args.tts_location, cooldown=args.tts_cooldown,
                 repeat_window=args.tts_repeat_window,
                 allow_runtime_synth=not args.tts_no_runtime_synth, **tts_kw)
-    reid = PersonReID(load_reid_encoder(args.reid_model) if args.reid else None, ttl_s=args.reid_ttl)
+    backend = make_backend(args.backend, args.waste_model, args.person_model)
+    reid = PersonReID(backend.reid_encoder(args.reid_model) if args.reid else None, ttl_s=args.reid_ttl)
     if args.reid and reid.enabled:
         print(f"[ReID] 활성 · 갤러리 보관 {args.reid_ttl:.0f}s")
     mosaic = FaceMosaic(args.mosaic, model_path=args.face_model)
     if mosaic.enabled:
         print(f"[모자이크] {mosaic.mode} 모드"
               + (" · 원본 스냅샷 별도 저장" if args.raw_snapshot else ""))
-    waste_model, waste_path = load_model(args.waste_model or "waste10_yolo26n")
-    person_model, person_path = load_model(args.person_model or "person_yolo26n")
-    print(f"waste={Path(waste_path).name} person={Path(person_path).name} -> {out_dir}")
+    print(f"backend={backend.name} waste={Path(backend.waste_path).name} "
+          f"person={Path(backend.person_path).name} -> {out_dir}")
 
     cap = cv2.VideoCapture(int(args.source) if args.source.isdigit() else args.source)
     if not cap.isOpened():
@@ -303,14 +372,7 @@ def main():
         frame_idx += 1
         frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        pr = person_model.track(frame, classes=[0], conf=PERSON_CONF, persist=True,
-                                tracker=TRACKER, verbose=False)[0]
-        persons = []
-        if pr.boxes is not None:
-            ids = pr.boxes.id
-            for k, b in enumerate(pr.boxes):
-                pid = int(ids[k]) if ids is not None else -(k + 1)
-                persons.append((pid, b.xyxy[0].tolist()))
+        persons = backend.track_persons(frame)
         # 재식별: 돌아온 사람에게 이전 pid를 돌려주고, 그동안 새 pid로 쌓인 상태를 옛 pid로 이관
         persons, merges = reid.update(frame, persons, frame_idx)
         for old_pid, new_pid in merges:
@@ -325,24 +387,20 @@ def main():
         person_hist.append((frame_idx, list(persons)))
         frame_buffer.append((frame_idx, frame_gray, list(persons)))
 
-        wr = waste_model.predict(frame, conf=WASTE_CONF, verbose=False)[0]
         ground_dets = []
-        if wr.boxes is not None:
-            for b in wr.boxes:
-                box = b.xyxy[0].tolist()
-                cls, conf = int(b.cls), float(b.conf)
-                holder = None
-                for pid, pbox in persons:
-                    cx, cy = center(box)
-                    inside = pbox[0] <= cx <= pbox[2] and pbox[1] <= cy <= pbox[3]
-                    if inside or iou(box, pbox) > CARRY_IOU:
-                        holder = pid
-                        break
-                if holder is not None:
-                    carried[holder] = {"cls": cls, "hist": color_hist(frame, box),
-                                       "last_frame": frame_idx, "box": box}
-                else:
-                    ground_dets.append((box, cls, conf))
+        for box, cls, conf in backend.detect_waste(frame):
+            holder = None
+            for pid, pbox in persons:
+                cx, cy = center(box)
+                inside = pbox[0] <= cx <= pbox[2] and pbox[1] <= cy <= pbox[3]
+                if inside or iou(box, pbox) > CARRY_IOU:
+                    holder = pid
+                    break
+            if holder is not None:
+                carried[holder] = {"cls": cls, "hist": color_hist(frame, box),
+                                   "last_frame": frame_idx, "box": box}
+            else:
+                ground_dets.append((box, cls, conf))
         ground_dets.sort(key=lambda d: -d[2])
         deduped = []
         for d in ground_dets:
