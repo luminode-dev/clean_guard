@@ -123,10 +123,12 @@ if res:
 # ------------------------------------------------------------------ 3) ultralytics와 일치
 print("\n3) ultralytics 결과와 일치 (같은 ONNX·프레임)")
 try:
+    import onnxruntime  # noqa: F401  .onnx 실행에 필수. 없으면 ultralytics가 pip 자동 설치를
+    #                      시도하는데, 보드에선 numpy 2를 끌어와 JetPack cv2를 깨뜨린다
     from ultralytics import YOLO
     from ultralytics.trackers.utils.reid import ReID
 except Exception as e:                                             # noqa: BLE001
-    print(f"  (건너뜀) ultralytics 없음: {e}")
+    print(f"  (건너뜀) ultralytics/onnxruntime 없음 — PC에서만 수행: {e}")
     YOLO = None
 if YOLO is not None and res:
     img = cv2.imread(str(ASSET))

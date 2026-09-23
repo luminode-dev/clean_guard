@@ -13,7 +13,8 @@ scipy                     # bytetrack.py (헝가리안 매칭)
 
 # --backend trt (torch 없는 경로) — Jetson:
 #   tensorrt      JetPack 기본 포함 (python3-libnvinfer)
-#   cuda-python   pip3 install cuda-python   (GPU 버퍼 관리)
+#   cuda-python   pip3 install 'cuda-python<13'   (GPU 버퍼 관리. 13.x는 JetPack 6의 CUDA 12
+#                 드라이버와 안 맞아 cudaErrorInsufficientDriver — 보드 실측 2026-09-23)
 #   PC 개발용 .onnx 실행에는 onnxruntime — 단 Jetson 기본 cv2와 numpy 충돌하므로 보드에선 .engine만 쓸 것
 
 # --- TTS 방송(--tts) 의존성은 여기에 넣지 말 것 ---

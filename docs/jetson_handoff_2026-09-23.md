@@ -62,11 +62,13 @@ python3 -c "import scipy; print('scipy', scipy.__version__)" || pip3 install sci
 ### 1-4. `--backend trt`를 쓸 거면
 
 ```bash
-pip3 install cuda-python
+pip3 install 'cuda-python<13'
 python3 -c "import tensorrt, cuda; print('trt', tensorrt.__version__)"
 ```
 
 `tensorrt`는 JetPack에 포함(`python3-libnvinfer`). `cuda-python`은 GPU 버퍼 관리용으로 새로 필요하다.
+**반드시 12.x로 설치할 것** — 13.x는 JetPack 6의 CUDA 12 드라이버와 안 맞아 엔진 로드 시
+`cudaErrorInsufficientDriver`(35)가 난다 (보드 실측 2026-09-23, 12.9.7로 정상 동작).
 
 ---
 
@@ -153,7 +155,8 @@ python3 dump_monitor_jetson.py --source <영상> --name trt --no-save-video --ba
 
 | 증상 | 원인 추정 | 대처 |
 |---|---|---|
-| `ModuleNotFoundError: cuda` | cuda-python 미설치 | `pip3 install cuda-python` |
+| `ModuleNotFoundError: cuda` | cuda-python 미설치 | `pip3 install 'cuda-python<13'` |
+| `cudaErrorInsufficientDriver`(35) | cuda-python 13.x 설치됨 | `pip3 install 'cuda-python<13'` 로 12.x 재설치 (보드 실측) |
 | `ImportError: cannot import name 'runtime'` | cuda-python 버전별 경로 차이 | 로그 보고 — `trt_backend.py:67` 의 두 import 분기 수정 필요 |
 | `엔진 역직렬화 실패` | JetPack/TensorRT 버전 불일치 | `./convert_tensorrt.sh` 재실행 |
 | `CUDA 오류` / 출력 이상 | FP16 입력 dtype, 동적 shape | 로그 + `trtexec --loadEngine=models/person_yolo26n.engine --verbose` 앞부분 보고 |
@@ -220,14 +223,15 @@ INT8은 FPS가 모자랄 때 쓰는 카드이며 캘리브레이션 데이터와
 
 ## 4. 알아두어야 할 것들
 
-- **RTSP 지연 누적**: 현재 코드는 프레임을 스킵하지 않는다. 추론 FPS가 카메라 FPS보다 낮으면
-  디코더 버퍼가 쌓여 화면이 점점 뒤처진다. 2-1의 FPS가 카메라 FPS보다 낮으면 알려 달라 —
-  "최신 프레임만 읽기"로 고쳐야 한다
+- **RTSP 지연 누적**: ~~현재 코드는 프레임을 스킵하지 않는다~~ **해결됨** — 보드 커밋
+  `708ce8a`(stream.py)가 라이브 입력에서 밀린 프레임을 드롭하고 최신 프레임만 읽는다.
+  끊기면 자동 재연결한다 (README "상시 운영 (RTSP 24/7)" 참고)
 - **로직 상수가 프레임 단위**: `STABLE_AGE 12`, `CLEAR_FRAMES 5`, `LOST_KEEP 300` 등은 프레임 수다.
   실제 FPS가 15와 크게 다르면 의미가 달라진다 (8fps면 잔류 판정이 0.8초 → 1.5초).
   실측 FPS를 알려주면 초 단위로 환산하도록 바꾼다
-- **`output/` 무한 증가**: 스냅샷·이벤트 로그가 계속 쌓인다. 순환 삭제가 아직 없으니
-  장기 운용 전에 cron으로 정리하거나 요청해 달라
+- **`output/` 무한 증가**: ~~순환 삭제가 아직 없으니~~ **해결됨** — 보드 커밋
+  `708ce8a`(recorder.py)가 디스크 여유가 임계(기본 1000MB) 아래로 내려가면 오래된
+  영상→스냅샷 순(video-first)으로 FIFO 회수한다
 - **`--raw-snapshot`**: 얼굴을 가리지 않은 원본을 따로 저장하는 옵션. 증거 보관용이며
   **폴더 접근 통제가 필요**하다. 기본은 꺼져 있다
 - **디스크**: 07-30 기준 여유 1.3GB였다. TTS 사전 렌더링(90MB)·엔진·`output/` 누적을 감안할 것
