@@ -295,6 +295,14 @@ python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조
 | `LOST_KEEP` | 300 | 재식별 보관 프레임 (긴 가림이 잦으면 늘릴 것) |
 | `CLEAR_FRAMES` | 5 | 사람 부재 확인 유예 |
 
+## 문서
+
+| 문서 | 내용 |
+|---|---|
+| [docs/jetson_handoff_2026-09-23.md](docs/jetson_handoff_2026-09-23.md) | **보드 인수인계** — 최신화 절차, 기능별 검증 순서와 기대 로그, 메모리 실측·절감, 보고 양식 |
+| [docs/dashboard_data_spec.md](docs/dashboard_data_spec.md) | 다장치 관제 대시보드 데이터 정의 (장치/하트비트/이벤트/스트림/알림) |
+| [docs/개발보고서_2026-07-30.md](docs/개발보고서_2026-07-30.md) | 이전 보드 작업 기록 (환경 실측값) |
+
 ## 성능 참고
 
 - RTX 5090 (FP32 PyTorch) 기준 640px 2모델 파이프라인 ~16-22 FPS (영상 인코딩 포함)
