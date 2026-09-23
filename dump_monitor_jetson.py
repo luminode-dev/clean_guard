@@ -349,6 +349,9 @@ def main():
     ap.add_argument("--person-model", default=None)
     ap.add_argument("--show", action="store_true", help="화면 표시 (모니터 연결 시)")
     ap.add_argument("--no-save-video", action="store_true", help="주석 영상 저장 생략")
+    ap.add_argument("--push", action="store_true",
+                    help="주석 프레임을 관제 서버로 SRT 송출 (720p/10fps H.264). "
+                         ".env의 SRT_HOST/SRT_STREAMID 필요. 끊기면 자동 재연결")
     ap.add_argument("--tts", action="store_true", help="이벤트 발생 시 음성 경고 방송")
     ap.add_argument("--tts-mode", default="live", choices=["live", "cache"],
                     help="live=이벤트마다 문구를 즉석 합성해 방송(기본) / "
@@ -476,6 +479,19 @@ def main():
     print(f"[디스크] 여유 {space.free_mb():.0f}MB · 임계 {args.min_free_mb:.0f}MB "
           f"· 회수 순서 {args.purge_order} · 스냅샷 "
           + (f"{args.snapshot_width}px 폭" if args.snapshot_width else "원본 해상도"))
+    pusher = None
+    if args.push:
+        # 주소·자격은 .env에서 읽는다 (명령줄에 두면 ps·셸 이력에 남는다)
+        srt_host = os.environ.get("SRT_HOST", "").strip()
+        srt_sid = os.environ.get("SRT_STREAMID", "").strip()
+        if not srt_host or not srt_sid:
+            ap.error(f"--push에는 {ENV_FILE}의 SRT_HOST와 SRT_STREAMID가 필요합니다"
+                     " (.env.example 참고)")
+        from srt_sender import SrtStreamer
+        pusher = SrtStreamer(srt_host, int(os.environ.get("SRT_PORT", "8890")), srt_sid,
+                             latency_ms=int(os.environ.get("SRT_LATENCY_MS", "200")))
+        print(f"[송출] SRT {srt_host}:{pusher.port} · {pusher.size[0]}x{pusher.size[1]}"
+              f"@{pusher.fps}fps x264 {pusher.kbps}kbps · 끊기면 자동 재연결")
     events_f = open(out_dir / "events.jsonl", "a", encoding="utf-8")
 
     objects, carried = [], {}
@@ -664,7 +680,7 @@ def main():
                 save_snapshot(out_dir / f"event_{n_events:04d}_raw.jpg", raw, o.box,
                               label, args.snapshot_width)
 
-        if recorder.enabled or args.show:
+        if recorder.enabled or args.show or pusher is not None:
             for pid, p in persons:
                 x1, y1, x2, y2 = map(int, p)
                 has_carry = pid in carried and frame_idx - carried[pid]["last_frame"] <= 5
@@ -686,6 +702,8 @@ def main():
                 cv2.putText(frame, f"EVENTS: {n_events}", (30, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             recorder.write(frame)
+            if pusher is not None:
+                pusher.push(frame)
             if args.show:
                 cv2.imshow("dump_monitor", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -705,6 +723,10 @@ def main():
         print(f"[{mosaic.summary()}]")
     if reid.enabled:
         print(f"[{reid.summary()}]")
+    if pusher is not None:
+        print(f"[송출] {pusher.frames_in}프레임 인코딩 · {pusher.sent_bytes / 1024:.0f}KiB 송신 "
+              f"· 재연결 {pusher.reconnects}회")
+        pusher.close()
     if announcer is not None:
         announcer.close()          # 큐에 남은 방송을 끝까지 재생한 뒤 종료
 

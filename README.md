@@ -30,7 +30,7 @@ CAM_LOCATION=정문 수거함 앞
 ```bash
 cd ~/Desktop/cleangaurd/clean_guard
 
-python3 dump_monitor_jetson.py --backend trt --tts --mosaic face --reid --no-save-video
+python3 dump_monitor_jetson.py --backend trt --tts --mosaic face --reid --push --no-save-video
 ```
 
 주소·이름·장소는 `.env`에서 자동으로 읽는다. 명령줄 인자를 주면 그쪽이 우선한다
@@ -39,6 +39,7 @@ python3 dump_monitor_jetson.py --backend trt --tts --mosaic face --reid --no-sav
 | 옵션 | 왜 |
 |---|---|
 | `--backend trt` | torch 미적재 — 상주 메모리 1185→494MB, 시작 5.0→1.4초 (보드 실측 2026-09-23). 통합 메모리라 그만큼 GPU 여유가 된다 |
+| `--push` | 주석 프레임(모자이크+박스)을 관제 서버로 SRT 송출 (720p/10fps x264). `.env`의 `SRT_HOST`/`SRT_STREAMID` 사용, 끊기면 5→30초 백오프로 무한 재연결. 서버가 안 열려 있어도 감시는 계속 돈다 |
 | `--tts` | 투기 발화 시 현장 스피커로 한국어 경고 방송 (온디바이스 합성) |
 | `--tts-location` | 방송 문구에 장소명 삽입 ("정문 수거함 앞에 파란색 페트병을…") |
 | `--mosaic face` | 출력물의 얼굴 픽셀화. 추론은 원본으로 하므로 정확도 영향 없음 |
@@ -75,6 +76,7 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video   #
 backend=trt waste=waste10_yolo26n.engine person=person_yolo26n.engine -> output/cam01
 [스트림] 라이브 입력 1920x1080 @15fps · 밀린 프레임 드롭 · 재연결 무한
 [디스크] 여유 1800MB · 임계 1000MB · 회수 순서 video-first · 스냅샷 640px 폭
+[송출] SRT cleanguard.duckdns.org:8890 · 1280x720@10fps x264 1500kbps · 끊기면 자동 재연결
 [TTS] 합성 워커 준비 완료 (N.Ns)
 ```
 
@@ -98,6 +100,7 @@ jetson_deploy/
 ├── dump_monitor_jetson.py      # 실행 모듈 (RTSP/웹캠/파일 입력)
 ├── stream.py                   # 입력 스트림 (RTSP 자동 재연결 + 최신 프레임 유지)
 ├── recorder.py                 # 주석 영상 회전 기록 + 디스크 FIFO 회수
+├── srt_sender.py               # 관제 서버 SRT 송출 (--push): libsrt 직접 호출 + x264 인코딩
 ├── trt_backend.py              # torch 없는 추론 백엔드 (TensorRT/onnxruntime 직접 호출, --backend trt)
 ├── bytetrack.py                #   └ 독립 ByteTrack (numpy/scipy)
 ├── mosaic.py                   # 사람 안면 모자이크 (OpenCV만 사용)
@@ -416,6 +419,7 @@ python3 tests/test_color_naming.py      # 색상 판정 (모델 불필요)
 python3 tests/test_mosaic.py            # 픽셀화/머리영역/YuNet 폴백 (YOLO 불필요)
 python3 tests/test_person_reid.py       # 재식별 갤러리 규칙 (가짜 임베더, 모델 불필요)
 python3 tests/test_trt_backend.py       # torch 없는 백엔드: ByteTrack 단위 + torch 미적재 확인 + ultralytics와 일치
+python3 tests/test_srt_push.py          # SRT 송출: 로컬 루프백 수신 + streamid + 자동 재연결 (서버 불필요)
 python3 tests/test_tts_offline.py       # 문구/실시간 합성/캐시/재생큐/쿨다운/폴백 (모델·스피커 불필요)
 python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조도/모자이크/재식별 발화→색상→방송 전 경로 (ultralytics 불필요)
 python3 tests/test_stream_recorder.py   # 입력 종류 판정/파일 EOF/영상 분할·보존·디스크 가드 (카메라·네트워크 불필요)
@@ -473,6 +477,13 @@ python3 tests/test_stream_recorder.py   # 입력 종류 판정/파일 EOF/영상
 
 - `--mosaic head|face`: 출력물의 사람 얼굴 픽셀화 (OpenCV YuNet, 추가 의존성 없음). 추론에는 영향 없음
 - `--raw-snapshot`: 원본 스냅샷 별도 보관 옵션
+
+### 관제 서버 SRT 송출 (2026-09-23)
+
+- `--push`: 주석 프레임을 720p/10fps H.264로 인코딩해 MediaMTX로 SRT push. 주소·비번은 `.env`
+- Orin Nano에는 **영상 인코더 하드웨어(NVENC)가 없다** (디코더만, 보드 실측) → x264 소프트웨어 인코딩
+- JetPack GStreamer(1.20.3)의 srtsink은 실서버 연결 시 SIGSEGV → [srt_sender.py](srt_sender.py)가 libsrt-gnutls를 ctypes로 직접 호출
+- 서버 쪽 UDP 8890이 닫혀 있으면 감시는 계속 돌고 송출만 5→30초 백오프로 재시도
 
 ### torch 없는 백엔드 (2026-09-21, 브랜치 `torch-free-backend`)
 
