@@ -30,7 +30,7 @@ CAM_LOCATION=정문 수거함 앞
 ```bash
 cd ~/Desktop/cleangaurd/clean_guard
 
-python3 dump_monitor_jetson.py --tts --mosaic face --reid --no-save-video
+python3 dump_monitor_jetson.py --backend trt --tts --mosaic face --reid --no-save-video
 ```
 
 주소·이름·장소는 `.env`에서 자동으로 읽는다. 명령줄 인자를 주면 그쪽이 우선한다
@@ -38,6 +38,7 @@ python3 dump_monitor_jetson.py --tts --mosaic face --reid --no-save-video
 
 | 옵션 | 왜 |
 |---|---|
+| `--backend trt` | torch 미적재 — 상주 메모리 1185→494MB, 시작 5.0→1.4초 (보드 실측 2026-09-23). 통합 메모리라 그만큼 GPU 여유가 된다 |
 | `--tts` | 투기 발화 시 현장 스피커로 한국어 경고 방송 (온디바이스 합성) |
 | `--tts-location` | 방송 문구에 장소명 삽입 ("정문 수거함 앞에 파란색 페트병을…") |
 | `--mosaic face` | 출력물의 얼굴 픽셀화. 추론은 원본으로 하므로 정확도 영향 없음 |
@@ -47,7 +48,7 @@ python3 dump_monitor_jetson.py --tts --mosaic face --reid --no-save-video
 재연결·프레임드롭·디스크 회수는 **전부 기본 동작**이라 따로 켤 필요가 없다. 최소 실행:
 
 ```bash
-python3 dump_monitor_jetson.py --tts
+python3 dump_monitor_jetson.py --backend trt --tts
 ```
 
 영상도 남기려면 `--no-save-video`를 빼고 보관량을 줄인다 (여유가 모자라면 오래된 것부터 자동 삭제):
@@ -71,7 +72,7 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video   #
 [TTS] 방송 활성 (실시간 합성, 백엔드=supertonic) · 재생=paplay · 위치='정문 수거함 앞'
 [ReID] 활성 · 갤러리 보관 600s
 [모자이크] face 모드
-waste=waste10_yolo26n.engine person=person_yolo26n.engine -> output/cam01
+backend=trt waste=waste10_yolo26n.engine person=person_yolo26n.engine -> output/cam01
 [스트림] 라이브 입력 1920x1080 @15fps · 밀린 프레임 드롭 · 재연결 무한
 [디스크] 여유 1800MB · 임계 1000MB · 회수 순서 video-first · 스냅샷 640px 폭
 [TTS] 합성 워커 준비 완료 (N.Ns)
@@ -169,8 +170,8 @@ python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video
 | 실행 주체 | ultralytics YOLO (torch 위) | [trt_backend.py](trt_backend.py): TensorRT Python API + cuda-python / onnxruntime **직접 호출** |
 | 트래커 | ultralytics ByteTrack | [bytetrack.py](bytetrack.py) 독립 구현 (numpy/scipy) |
 | 모델 포맷 | .engine → .onnx → .pt | .engine → .onnx (.pt 없음) |
-| 상주 메모리 | torch + CUDA 컨텍스트 **1GB+** | TensorRT 런타임만 (수백 MB) |
-| 시작 시간 | torch import 10~20초 | 수 초 |
+| 상주 메모리 | torch + CUDA 컨텍스트 — 피크 RSS **1,185MB** (보드 실측) | TensorRT 런타임만 — 피크 RSS **494MB** (보드 실측) |
+| 시작~첫 추론 | 5.0초 (콜드 스타트 17.7초) | **1.4초** |
 
 ```bash
 python3 dump_monitor_jetson.py --source 0 --name cam01 --backend trt --reid --mosaic head
@@ -184,9 +185,12 @@ Re-ID 임베딩 코사인 1.000, 데모 영상 211프레임에서 이벤트·트
 (`tests/test_trt_backend.py`). Jetson에서 `trt`를 쓰면 `.engine`만 있으면 되므로
 onnxruntime(numpy 2 충돌)도 필요 없다.
 
-**보드에서 확인 필요** (PC엔 TensorRT가 없어 onnxruntime 경로만 검증됨): `cuda-python` 설치
-(`pip3 install cuda-python`), `.engine` 로드·FP16 입력 dtype·Re-ID 동적 배치. 문제가 있으면
-로그에 `사용 불가 -> 다음 포맷 시도`가 찍히고 `.onnx`로 내려가며, 그것도 안 되면 `--backend ultralytics`로.
+**보드 검증 완료 (2026-09-23, Jetson Orin Nano 8GB):** `pip3 install 'cuda-python<13'` 후
+TensorRT(.engine) 경로로 탐지 2모델 + Re-ID(동적 배치) 모두 정상 — `tests/test_trt_backend.py` 1·2부 통과,
+실카메라(RTSP 2560x1440@30fps)에서 `--backend trt --reid --mosaic face` 기동 확인.
+상주 메모리 피크 1,185→494MB (통합 메모리라 절감분 약 690MB가 곧 GPU 여유).
+주의: cuda-python 13.x는 JetPack 6의 CUDA 12 드라이버와 안 맞아 `cudaErrorInsufficientDriver`가 난다 — 반드시 12.x.
+문제가 있으면 로그에 `사용 불가 -> 다음 포맷 시도`가 찍히고 `.onnx`로 내려가며, 그것도 안 되면 `--backend ultralytics`로.
 
 ### 모델 자동 선택과 폴백
 
@@ -473,8 +477,9 @@ python3 tests/test_stream_recorder.py   # 입력 종류 판정/파일 EOF/영상
 ### torch 없는 백엔드 (2026-09-21, 브랜치 `torch-free-backend`)
 
 - `--backend trt`: TensorRT/onnxruntime 직접 호출 + 독립 ByteTrack. torch·ultralytics 미적재, 출력 동일
-- PC 실측(CPU): 피크 메모리 629→481MB, 1.5→3.2 FPS. Jetson에서는 CUDA 컨텍스트가 빠져 차이가 더 클 것
-- 보드 확인 필요: TensorRT 경로(`TrtRuntime`) 실동작
+- PC 실측(CPU): 피크 메모리 629→481MB, 1.5→3.2 FPS
+- 보드 실측(2026-09-23, Orin Nano 8GB): TensorRT 경로 정상 동작 확인, 피크 RSS 1,185→494MB ·
+  시작 5.0→1.4초. `cuda-python<13` 필요 (13.x는 CUDA 12 드라이버 불일치). 빠른 실행 명령에 기본 반영
 
 ### 사람 재식별 (2026-09-20)
 
