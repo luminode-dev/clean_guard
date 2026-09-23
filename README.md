@@ -16,6 +16,8 @@ jetson_deploy/
 │   ├── yolo26n-reid.onnx       # 사람 재식별 임베더 (9.4MB, --reid). .engine은 convert_tensorrt.sh가 생성
 │   └── tts/supertonic-2/       # ← setup_tts.sh 가 내려받는 TTS 모델 (약 256MB)
 ├── dump_monitor_jetson.py      # 실행 모듈 (RTSP/웹캠/파일 입력)
+├── trt_backend.py              # torch 없는 추론 백엔드 (TensorRT/onnxruntime 직접 호출, --backend trt)
+├── bytetrack.py                #   └ 독립 ByteTrack (numpy/scipy)
 ├── mosaic.py                   # 사람 안면 모자이크 (OpenCV만 사용)
 ├── person_reid.py              # 사람 재식별 (외형 임베딩 갤러리, 트래커 위에 얹음)
 ├── convert_tensorrt.sh         # TensorRT 변환 (Jetson에서 실행)
@@ -78,6 +80,32 @@ python3 dump_monitor_jetson.py --source 0 --name webcam --show
 # 영상 파일 테스트 (주석 영상 저장 생략으로 속도 확보)
 python3 dump_monitor_jetson.py --source test.mp4 --name test --no-save-video
 ```
+
+### 추론 백엔드 (`--backend`)
+
+| | `ultralytics` (기본) | `trt` |
+|---|---|---|
+| 실행 주체 | ultralytics YOLO (torch 위) | [trt_backend.py](trt_backend.py): TensorRT Python API + cuda-python / onnxruntime **직접 호출** |
+| 트래커 | ultralytics ByteTrack | [bytetrack.py](bytetrack.py) 독립 구현 (numpy/scipy) |
+| 모델 포맷 | .engine → .onnx → .pt | .engine → .onnx (.pt 없음) |
+| 상주 메모리 | torch + CUDA 컨텍스트 **1GB+** | TensorRT 런타임만 (수백 MB) |
+| 시작 시간 | torch import 10~20초 | 수 초 |
+
+```bash
+python3 dump_monitor_jetson.py --source 0 --name cam01 --backend trt --reid --mosaic head
+```
+
+ultralytics는 학습·내보내기·모든 백엔드를 한 API로 다루려고 torch 위에 만들어져 있는데, 만들어진
+엔진을 돌리기만 하는 배포 장비에서 추론 경로가 실제로 하는 일은 레터박스 → /255 → 엔진 실행 →
+출력 파싱뿐이다 (YOLO26은 NMS-free라 후처리가 없다). `trt` 백엔드는 그 부분만 numpy/OpenCV로
+다시 구현했다. **같은 입력에서 두 백엔드의 출력이 일치한다** — 탐지 박스 IoU ≥ 0.999·conf 차 ≤ 5e-5,
+Re-ID 임베딩 코사인 1.000, 데모 영상 211프레임에서 이벤트·트랙 id·재식별 병합까지 동일
+(`tests/test_trt_backend.py`). Jetson에서 `trt`를 쓰면 `.engine`만 있으면 되므로
+onnxruntime(numpy 2 충돌)도 필요 없다.
+
+**보드에서 확인 필요** (PC엔 TensorRT가 없어 onnxruntime 경로만 검증됨): `cuda-python` 설치
+(`pip3 install cuda-python`), `.engine` 로드·FP16 입력 dtype·Re-ID 동적 배치. 문제가 있으면
+로그에 `사용 불가 -> 다음 포맷 시도`가 찍히고 `.onnx`로 내려가며, 그것도 안 되면 `--backend ultralytics`로.
 
 ### 모델 자동 선택과 폴백
 
@@ -243,6 +271,7 @@ python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-mode cache --
 python3 tests/test_color_naming.py      # 색상 판정 (모델 불필요)
 python3 tests/test_mosaic.py            # 픽셀화/머리영역/YuNet 폴백 (YOLO 불필요)
 python3 tests/test_person_reid.py       # 재식별 갤러리 규칙 (가짜 임베더, 모델 불필요)
+python3 tests/test_trt_backend.py       # torch 없는 백엔드: ByteTrack 단위 + torch 미적재 확인 + ultralytics와 일치
 python3 tests/test_tts_offline.py       # 문구/실시간 합성/캐시/재생큐/쿨다운/폴백 (모델·스피커 불필요)
 python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조도/모자이크/재식별 발화→색상→방송 전 경로 (ultralytics 불필요)
 .venv-tts/bin/python prerender_tts.py --check   # 실제 합성 + 스피커 재생
@@ -291,6 +320,12 @@ python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조
 
 - `--mosaic head|face`: 출력물의 사람 얼굴 픽셀화 (OpenCV YuNet, 추가 의존성 없음). 추론에는 영향 없음
 - `--raw-snapshot`: 원본 스냅샷 별도 보관 옵션
+
+### torch 없는 백엔드 (2026-09-21, 브랜치 `torch-free-backend`)
+
+- `--backend trt`: TensorRT/onnxruntime 직접 호출 + 독립 ByteTrack. torch·ultralytics 미적재, 출력 동일
+- PC 실측(CPU): 피크 메모리 629→481MB, 1.5→3.2 FPS. Jetson에서는 CUDA 컨텍스트가 빠져 차이가 더 클 것
+- 보드 확인 필요: TensorRT 경로(`TrtRuntime`) 실동작
 
 ### 사람 재식별 (2026-09-20)
 
