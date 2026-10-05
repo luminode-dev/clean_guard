@@ -172,13 +172,16 @@ class OutputSpace:
       "oldest-first"       : 종류를 가리지 않고 순수하게 오래된 파일부터 (엄격한 FIFO).
 
     events.jsonl은 어떤 경우에도 지우지 않는다 — 용량이 작고, 그것이 곧 이벤트 기록이다.
+
+    공간과 별개로 expire()는 보존 기간이 지난 증거를 지운다 (handoff §3.3 기준안:
+    모자이크본 90일, 원본(*_raw.*) 30일). 0이면 기간 삭제 안 함.
     """
 
     VIDEO_GLOB = "annotated_*.mp4"
-    EVENT_GLOB = "event_*.jpg"
+    EVENT_GLOB = "event_*.*"            # 스냅샷 jpg + 클립 mp4 + 방송 음성 wav (events.jsonl은 안 걸림)
 
     def __init__(self, out_dir, min_free_mb=1000.0, headroom_mb=200.0,
-                 purge_order="video-first"):
+                 purge_order="video-first", keep_days=90.0, raw_keep_days=30.0):
         self.dir = Path(out_dir)
         self.min_free_mb = float(min_free_mb)
         # 임계선에 딱 맞춰 멈추면 곧바로 다시 걸리므로 조금 더 확보하고 끝낸다
@@ -187,6 +190,8 @@ class OutputSpace:
         self.n_deleted = 0
         self.mb_freed = 0.0
         self.n_starved = 0          # 지울 게 없어 회수에 실패한 횟수
+        self.keep_days, self.raw_keep_days = float(keep_days), float(raw_keep_days)
+        self.n_expired = 0
 
     def _by_age(self, glob, exclude):
         """glob에 걸리는 파일을 오래된 순으로. (mtime, path) 목록."""
@@ -238,9 +243,30 @@ class OutputSpace:
                       f"다른 곳을 비우거나 --min-free-mb를 낮출 것")
         return deleted, freed
 
+    def expire(self, now=None, exclude=None):
+        """보존 기간이 지난 증거 파일(스냅샷·클립·방송 음성)을 지운다. 삭제 수 반환."""
+        now = time.time() if now is None else now
+        n = 0
+        for mtime, p in self._by_age(self.EVENT_GLOB, exclude):
+            days = self.raw_keep_days if "_raw." in p.name else self.keep_days
+            if days <= 0 or now - mtime < days * 86400:
+                continue
+            try:
+                p.unlink()
+                n += 1
+            except OSError:
+                pass
+        if n:
+            self.n_expired += n
+            print(f"[디스크] 보존 기간 경과 증거 {n}개 삭제 "
+                  f"(모자이크 {self.keep_days:g}일 · 원본 {self.raw_keep_days:g}일)", flush=True)
+        return n
+
     def summary(self):
         s = (f"디스크: 오래된 출력물 {self.n_deleted}개 삭제({self.mb_freed:.0f}MB 회수) "
              f"· 현재 여유 {self.free_mb():.0f}MB")
+        if self.n_expired:
+            s += f" · 보존 기간 경과 {self.n_expired}개 삭제"
         if self.n_starved:
             s += f" · 회수 실패 {self.n_starved}회"
         return s

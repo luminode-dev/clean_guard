@@ -45,20 +45,22 @@ class WavPlayer:
         self._thread.start()
         return self
 
-    def submit(self, wav_path, cleanup=False):
+    def submit(self, wav_path, cleanup=False, on_done=None):
         """재생 요청. 큐가 가득 차면 오래된 것을 버리고 넣는다.
-        cleanup=True면 재생(또는 폐기) 후 파일을 지운다 — 실시간 합성한 임시 wav용."""
+        cleanup=True면 재생(또는 폐기) 후 파일을 지운다 — 실시간 합성한 임시 wav용.
+        on_done(path)은 재생이 끝난 뒤(재생 스레드에서) 부른다. 폐기된 항목은 부르지 않는다
+        — 방송 음성 서버 첨부용: 재생 전에 업로드 확인으로 파일이 지워지는 일이 없게."""
         if self.cmd is None:
             if cleanup:
                 self._unlink(wav_path)
             return False
-        item = (str(wav_path), cleanup)
+        item = (str(wav_path), cleanup, on_done)
         try:
             self.q.put_nowait(item)
             return True
         except queue.Full:
             try:
-                old_path, old_clean = self.q.get_nowait()
+                old_path, old_clean, _ = self.q.get_nowait()
                 self.dropped += 1
                 if old_clean:
                     self._unlink(old_path)
@@ -83,7 +85,7 @@ class WavPlayer:
     def _run(self):
         while not self._stop.is_set():
             try:
-                path, cleanup = self.q.get(timeout=0.3)
+                path, cleanup, on_done = self.q.get(timeout=0.3)
             except queue.Empty:
                 continue
             try:
@@ -93,6 +95,11 @@ class WavPlayer:
             except Exception as e:                               # noqa: BLE001
                 print(f"[TTS 경고] 재생 실패 ({type(e).__name__}): {path}")
             finally:
+                if on_done is not None:
+                    try:
+                        on_done(path)
+                    except Exception as e:                       # noqa: BLE001
+                        print(f"[TTS 경고] 방송 음성 전달 실패 ({type(e).__name__}: {e})")
                 if cleanup:
                     self._unlink(path)
 

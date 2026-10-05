@@ -179,15 +179,15 @@ class SupertonicBackend:
             return True
 
     def render_one(self, text, out):
-        """문장 하나를 상주 워커로 합성. 성공하면 True, 실패하면 RuntimeError."""
+        """문장 하나를 상주 워커로 합성해 wav로 쓴다. 성공하면 True, 실패하면 RuntimeError."""
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             if not self._alive():
                 self._start_server()
             p = self._proc
             try:
-                p.stdin.write(json.dumps({"text": text, "out": str(out)},
-                                         ensure_ascii=False) + "\n")
+                job = {"text": text, "out": str(out)}
+                p.stdin.write(json.dumps(job, ensure_ascii=False) + "\n")
                 p.stdin.flush()
                 line = p.stdout.readline()
             except (OSError, ValueError) as e:

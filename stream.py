@@ -74,6 +74,7 @@ class FrameSource:
         self.n_reconnect = 0
         self.n_dropped = 0
         self.n_read = 0
+        self._reconnecting = False       # 하트비트 pipeline.stream 판정용
         self._thread = None
         self._cv = threading.Condition()
         self._latest = None
@@ -125,6 +126,13 @@ class FrameSource:
 
     def _reconnect(self):
         """끊긴 연결을 다시 세운다. 성공하면 True, 포기하면 False."""
+        self._reconnecting = True
+        try:
+            return self._reconnect_loop()
+        finally:
+            self._reconnecting = False
+
+    def _reconnect_loop(self):
         tries, delay = 0, self.delay0
         while not self._stop.is_set():
             tries += 1
@@ -199,6 +207,13 @@ class FrameSource:
                         # 아직 살아 있지만 이번 주기에 새 프레임이 없었다.
                         # 호출부가 --show의 q 입력 등을 처리할 수 있게 일단 돌려준다.
                         return True, None
+
+    @property
+    def state(self):
+        """하트비트용 스트림 상태: ok | reconnecting | lost (jetson_data.md §3)."""
+        if self._done or (self.cap is None and not self._reconnecting):
+            return "lost"
+        return "reconnecting" if self._reconnecting else "ok"
 
     # ------------------------------------------------------------ 종료
     def close(self):

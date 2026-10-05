@@ -35,6 +35,10 @@ class _Runtime:
     def run(self, x):
         raise NotImplementedError
 
+    def input_shape(self):
+        """입력 NCHW shape. 동적 축은 -1 또는 문자열."""
+        raise NotImplementedError
+
     def close(self):
         pass
 
@@ -49,8 +53,21 @@ class OrtRuntime(_Runtime):
         self.sess = ort.InferenceSession(str(path), providers=providers or ["CPUExecutionProvider"])
         self.inp = self.sess.get_inputs()[0].name
 
+    def input_shape(self):
+        return tuple(self.sess.get_inputs()[0].shape)
+
     def run(self, x):
         return self.sess.run(None, {self.inp: np.ascontiguousarray(x, dtype=np.float32)})[0]
+
+
+def _strip_ultralytics_header(blob):
+    """ultralytics export(.engine)는 플랜 앞에 [int32 길이][메타 JSON]을 붙인다 -> 떼어낸다.
+    trtexec로 만든 순수 플랜(b'ftrt'로 시작)은 그대로 둔다."""
+    if blob[:4] != b"ftrt" and len(blob) > 4:
+        n = int.from_bytes(blob[:4], "little", signed=True)
+        if 0 < n < len(blob) - 4 and blob[4:5] == b"{" and blob[4 + n:8 + n] == b"ftrt":
+            return blob[4 + n:]
+    return blob
 
 
 class TrtRuntime(_Runtime):
@@ -71,7 +88,7 @@ class TrtRuntime(_Runtime):
         self.trt, self.cudart = trt, cudart
         logger = trt.Logger(trt.Logger.WARNING)
         with open(path, "rb") as f, trt.Runtime(logger) as rt:
-            self.engine = rt.deserialize_cuda_engine(f.read())
+            self.engine = rt.deserialize_cuda_engine(_strip_ultralytics_header(f.read()))
         if self.engine is None:
             raise RuntimeError(f"엔진 역직렬화 실패: {path}")
         self.ctx = self.engine.create_execution_context()
@@ -112,6 +129,9 @@ class TrtRuntime(_Runtime):
         self.ctx.set_tensor_address(self.out, int(self.d_out))
         self.out_shape = out_shape
         self.in_shape = in_shape
+
+    def input_shape(self):
+        return tuple(self.engine.get_tensor_shape(self.inp))
 
     def run(self, x):
         x = np.ascontiguousarray(x, dtype=self.input_dtype)
@@ -168,11 +188,15 @@ def load_with_fallback(stem_or_path, factory, label):
 
 # =============================================================== 전처리
 def letterbox(img, size=640, pad=PAD_VALUE):
-    """ultralytics LetterBox(auto=False, scaleup=True)와 동일: 비율 유지 리사이즈 + 중앙 패딩."""
+    """ultralytics LetterBox(auto=False, scaleup=True)와 동일: 비율 유지 리사이즈 + 중앙 패딩.
+
+    size: 정수(정사각형) 또는 (h, w). 16:9 입력은 (384, 640) 엔진을 쓰면 패딩이 위아래 12px로
+    줄어 640x640 대비 연산이 40% 준다 (360은 stride 32의 배수가 아니라 384)."""
+    sh, sw = (size, size) if isinstance(size, int) else size
     h, w = img.shape[:2]
-    r = min(size / h, size / w)
+    r = min(sh / h, sw / w)
     nw, nh = round(w * r), round(h * r)
-    dw, dh = (size - nw) / 2, (size - nh) / 2
+    dw, dh = (sw - nw) / 2, (sh - nh) / 2
     if (nw, nh) != (w, h):
         img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
     top, bottom = round(dh - 0.1), round(dh + 0.1)
@@ -215,11 +239,13 @@ class Detector:
 
     def __init__(self, path, imgsz=640):
         self.rt = open_runtime(path)
-        self.imgsz = imgsz
+        # 고정 shape 엔진이면 입력 크기를 엔진에서 읽는다 (640x640 / 384x640 등). 동적이면 imgsz
+        hw = tuple(self.rt.input_shape()[2:])
+        self.imgsz = hw if all(isinstance(d, int) and d > 0 for d in hw) else (imgsz, imgsz)
         self.path = str(path)
 
     def warmup(self):
-        self.detect(np.zeros((self.imgsz, self.imgsz, 3), np.uint8))
+        self.detect(np.zeros((*self.imgsz, 3), np.uint8))
 
     def detect(self, frame, conf=0.25, classes=None):
         lb, r, (px, py) = letterbox(frame, self.imgsz)

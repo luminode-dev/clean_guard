@@ -13,6 +13,9 @@ usage:
   python3 synth_worker.py --serve [같은 옵션]
 
 jobs.json: [{"text": "...", "out": "/abs/path.wav"}, ...]
+          결과는 wav 하나뿐이다. 스피커 재생과 서버 전송(announce_audio)에 같은 파일을 쓴다
+          (2026-10-05: mp3 변환을 없앴다 — 방송 시작이 0.4초 늦어지고, 서버가 wav를 받기로 함).
+          서버 규격(PCM 16-bit mono, 16~24kHz 권장)에 맞춰 모델 출력 44.1kHz를 24kHz로 내려 쓴다.
 --serve   : 준비되면 {"ready": true, "load_sec": float} 한 줄을 먼저 출력하고,
             이후 stdin 한 줄({"text":..., "out":...})마다 결과 한 줄을 돌려준다.
             빈 줄 또는 EOF를 받으면 종료.
@@ -20,13 +23,34 @@ stdout: 작업당 JSON 한 줄 {"out":..., "ok":bool, "sec":float, "err":str|nul
 """
 import argparse
 import json
+import os
 import sys
 import time
 import wave
 
 
-def write_wav_int16(path, wav, sample_rate, peak=0.89):
-    """float32 (-1..1) 또는 int16 배열을 16-bit mono PCM wav로 저장.
+OUT_RATE = 24000    # 서버 announce_audio 권장 16~24kHz. 음성 대역(~12kHz)은 그대로 남는다
+
+
+def resample(a, sr, out_sr):
+    """FFT 리샘플 (이상적 저역 통과). 앞뒤가 무음인 방송 문구라 경계 왜곡이 없다.
+    scipy 없이 numpy만 — 11초 문구 수십 ms."""
+    import numpy as np
+
+    if out_sr == sr:
+        return a
+    n = int(round(len(a) * out_sr / sr))
+    spec = np.fft.rfft(a)
+    keep = n // 2 + 1
+    if keep <= len(spec):
+        spec = spec[:keep]
+    else:
+        spec = np.concatenate([spec, np.zeros(keep - len(spec), spec.dtype)])
+    return (np.fft.irfft(spec, n) * (n / len(a))).astype(np.float32)
+
+
+def write_wav_int16(path, wav, sample_rate, peak=0.89, out_rate=OUT_RATE):
+    """float32 (-1..1) 또는 int16 배열을 16-bit mono PCM wav로 저장 (out_rate Hz로 리샘플).
 
     peak > 0이면 피크 정규화한다. Supertonic 원본은 -11dB 정도로 야외 스피커에는
     작으므로, 방송 음량을 확보하기 위해 헤드룸만 남기고 끌어올린다.
@@ -37,6 +61,8 @@ def write_wav_int16(path, wav, sample_rate, peak=0.89):
     if a.ndim > 1:                      # (1, T) 또는 다채널 -> mono
         a = a.reshape(a.shape[-1]) if a.shape[0] == 1 else a.mean(axis=0)
     a = a.astype(np.float32) / 32768.0 if a.dtype == np.int16 else a.astype(np.float32)
+    if out_rate and out_rate != sample_rate:
+        a, sample_rate = resample(a, int(sample_rate), int(out_rate)), int(out_rate)
     if peak > 0:
         mx = float(np.abs(a).max())
         if mx > 1e-4:
@@ -62,9 +88,9 @@ def synth_one(tts, style, args, job):
                                   lang=args.lang)
         write_wav_int16(out, wav, tts.sample_rate)
         sec = float(dur[0]) if hasattr(dur, "__len__") else float(dur)
-        return {"out": out, "ok": True, "sec": round(sec, 2), "err": None}
     except Exception as e:                                       # noqa: BLE001
         return {"out": out, "ok": False, "sec": 0.0, "err": f"{type(e).__name__}: {e}"}
+    return {"out": out, "ok": True, "sec": round(sec, 2), "err": None}
 
 
 def serve(tts, style, args):

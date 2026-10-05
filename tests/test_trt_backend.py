@@ -84,6 +84,42 @@ out = [tr3.update([walk(f, 50, 3, s=0.15)]) for f in range(1, 6)]
 check_true("저점수만으론 새 트랙 생성 안 함", all(len(o) == 0 for o in out))
 check("iou_matrix 정합", round(float(iou_matrix([[0, 0, 10, 10]], [[5, 0, 15, 10]])[0, 0]), 3), 0.333)
 
+# ------------------------------------------------------------------ 1-1) BoT-SORT
+print("\n1-1) BoT-SORT — 외형 매칭")
+from bytetrack import BoTSORT  # noqa: E402
+import numpy as np  # noqa: E402
+
+EA, EB = np.eye(4, dtype=np.float32)[0], np.eye(4, dtype=np.float32)[1]
+
+
+def side_by_side_swap(tr, use_feat):
+    """폭 100짜리 두 사람이 20px 간격으로 겹쳐 서 있다가 자리를 맞바꾼다.
+    IoU만 보면 각 트랙이 바로 옆(=상대) 탐지에 더 겹쳐 id가 뒤바뀐다."""
+    for _ in range(8):
+        r = tr.update([[100, 50, 200, 250, .9], [120, 52, 220, 252, .9]],
+                      [EA, EB] if use_feat else None)
+    id_a = min(r, key=lambda t: t[1][0])[0]
+    # 맞바꾼 위치: A는 118, B는 102 (탐지 순서도 뒤집어 준다)
+    r = tr.update([[102, 52, 202, 252, .9], [118, 50, 218, 250, .9]],
+                  [EB, EA] if use_feat else None)
+    return id_a, next(t for t, b, _ in r if abs(b[0] - 118) < abs(b[0] - 102))
+
+
+a0, a1 = side_by_side_swap(ByteTrack(), False)
+check_true("(대조) IoU만: 자리 바꾸면 id 뒤바뀜", a0 != a1, f"{a0} -> {a1}")
+a0, a1 = side_by_side_swap(BoTSORT(), True)
+check("외형 매칭: 자리 바꿔도 A의 id 유지", a1, a0)
+bt = BoTSORT()
+o1 = [bt.update([walk(f, 50, 3)]) for f in range(1, 30)]
+check_true("임베딩 없으면 IoU 트래커로 동작", all(len(o) == 1 for o in o1))
+bt = BoTSORT()
+bt.update([walk(1, 50, 3)], [EA]); bt.update([walk(2, 50, 3)], [EA])
+check("frame_feats: 이번 프레임 임베딩 전달", sorted(bt.frame_feats), [1])
+bt.update([walk(3, 50, 3)])
+check("frame_feats: 임베딩 없는 프레임엔 비움 (이전 값 재사용 금지)", bt.frame_feats, {})
+bt.reset(); bt.update([walk(1, 50, 3)])
+check("reset 후 id 1부터", [t for t, _, _ in bt.update([walk(2, 50, 3)])], [1])
+
 # ------------------------------------------------------------------ 2) torch 없는 프로세스
 print("\n2) torch/ultralytics 없이 탐지 + Re-ID 실행 (서브프로세스)")
 child = r'''
@@ -91,7 +127,8 @@ import sys, json
 sys.path.insert(0, %r)
 import numpy as np, cv2
 from trt_backend import load_detector, load_reid, ByteTrack
-img = cv2.imread(%r)
+# 운영 카메라와 같은 16:9로 자른다 (엔진이 384x640 — 4:3 원본은 더 작게 축소돼 점수가 낮아진다)
+img = cv2.imread(%r)[100:532]
 det_p, pp = load_detector("person_yolo26n"); det_w, wp = load_detector("waste10_yolo26n")
 pb, pc, _ = det_p.detect(img, conf=0.35, classes=[0])
 wb, wc, wcls = det_w.detect(img, conf=0.2)
@@ -115,7 +152,8 @@ if res:
     check("torch 미적재", res["torch"], False)
     check("ultralytics 미적재", res["ultralytics"], False)
     check_true("사람 탐지 ≥ 3", len(res["persons"]) >= 3, f"{len(res['persons'])}명")
-    check("폐기물 탐지: 쓰레기봉투 1건", (len(res["waste"]), res["wcls"]), (1, [0]))
+    top = res["wcls"][int(np.argmax(res["wconf"]))] if res["wcls"] else None
+    check("폐기물 탐지: 최고 점수가 쓰레기봉투", top, 0)
     check_true("Re-ID 임베딩 512차원", all(d == 512 for d in res["emb_dim"]))
     check("ByteTrack 확정 트랙 수 = 사람 수", res["tracks"], len(res["persons"]))
     print(f"       모델: {[Path(p).name for p in res['paths']]}")

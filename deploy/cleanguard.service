@@ -1,0 +1,19 @@
+[Unit]
+Description=CleanGuard 무단투기 감시 (카메라 -> 관제 서버 송출)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=gailab
+WorkingDirectory=/home/gailab/Desktop/cleangaurd/clean_guard
+Environment=PYTHONUNBUFFERED=1
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/bin/python3 dump_monitor_jetson.py --backend trt --tts --mosaic face --reid --push --report --no-save-video --out /dev/shm/cleanguard --min-free-mb 3000
+StandardOutput=append:/dev/shm/cleanguard.log
+StandardError=inherit
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

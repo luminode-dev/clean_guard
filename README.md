@@ -30,7 +30,7 @@ CAM_LOCATION=정문 수거함 앞
 ```bash
 cd ~/Desktop/cleangaurd/clean_guard
 
-python3 dump_monitor_jetson.py --backend trt --tts --mosaic face --reid --push --no-save-video
+python3 dump_monitor_jetson.py --backend trt --tts --mosaic face --reid --push --report --no-save-video
 ```
 
 주소·이름·장소는 `.env`에서 자동으로 읽는다. 명령줄 인자를 주면 그쪽이 우선한다
@@ -40,6 +40,7 @@ python3 dump_monitor_jetson.py --backend trt --tts --mosaic face --reid --push -
 |---|---|
 | `--backend trt` | torch 미적재 — 상주 메모리 1185→494MB, 시작 5.0→1.4초 (보드 실측 2026-09-23). 통합 메모리라 그만큼 GPU 여유가 된다 |
 | `--push` | 주석 프레임(모자이크+박스)을 관제 서버로 SRT 송출 (720p/10fps x264). `.env`의 `SRT_HOST`/`SRT_STREAMID` 사용, 끊기면 5→30초 백오프로 무한 재연결. 서버가 안 열려 있어도 감시는 계속 돈다 |
+| `--report` | 이벤트 JSON+스냅샷을 관제 서버 API로 전송 → 대시보드 사건 목록에 표시. `.env`의 `API_URL`/`DEVICE_TOKEN`/`DEVICE_ID`/`SITE_ID` 사용. 실패 시 디스크 큐(`output/queue/events/`)에 보관 후 5초→5분 백오프로 재전송 — 회선이 끊겨도 유실 없음. 30초 하트비트·사건 전후 10초 클립·회수 보고·5초 썸네일·ROI 원격 설정이 함께 켜진다 (아래 2026-10-04 항목) |
 | `--tts` | 투기 발화 시 현장 스피커로 한국어 경고 방송 (온디바이스 합성) |
 | `--tts-location` | 방송 문구에 장소명 삽입 ("정문 수거함 앞에 파란색 페트병을…") |
 | `--mosaic face` | 출력물의 얼굴 픽셀화. 추론은 원본으로 하므로 정확도 영향 없음 |
@@ -101,6 +102,11 @@ jetson_deploy/
 ├── stream.py                   # 입력 스트림 (RTSP 자동 재연결 + 최신 프레임 유지)
 ├── recorder.py                 # 주석 영상 회전 기록 + 디스크 FIFO 회수
 ├── srt_sender.py               # 관제 서버 SRT 송출 (--push): libsrt 직접 호출 + x264 인코딩
+├── event_sender.py             # 관제 서버 이벤트 전송 (--report): ULID + 디스크 큐 + 재전송
+├── heartbeat.py                #   └ 30초 하트비트 + 5초 썸네일
+├── roi.py                      #   └ 감시 구역(ROI) 판정 + 대시보드 설정 동기화 (config/roi.json)
+├── retrieval.py                #   └ 회수 판정 -> event_update
+├── clip.py                     #   └ 사건 전후 클립 (JPEG 링버퍼 -> x264 mp4)
 ├── trt_backend.py              # torch 없는 추론 백엔드 (TensorRT/onnxruntime 직접 호출, --backend trt)
 ├── bytetrack.py                #   └ 독립 ByteTrack (numpy/scipy)
 ├── mosaic.py                   # 사람 안면 모자이크 (OpenCV만 사용)
@@ -395,7 +401,9 @@ python3 dump_monitor_jetson.py --source 0 --name cam01 --tts --tts-mode cache --
 | `--tts-cache` | `cache/tts` | 사전 렌더링 wav 폴더. live 모드에선 합성 실패 시 폴백용 |
 | `--tts-no-runtime-synth` | off | (cache 모드) 캐시 미스 시 즉석 합성 대신 방송 생략 |
 | `--tts-backend` | `supertonic` | `null`로 두면 무음 wav — 배선 점검용 |
-| `--tts-model` / `--tts-voice` | `supertonic-2` / `M4` | 합성 모델 / 목소리 (M1~M5, F1~F5) |
+| `--tts-model` / `--tts-voice` | `supertonic-2` / `.env TTS_VOICE` (없으면 `M4`) | 합성 모델 / 목소리 (M1~M5, F1~F5). 현장은 F2 |
+| `--tts-steps` | `.env TTS_STEPS` (없으면 `8`) | 합성 품질(디노이징 스텝). 8에서 약 3.2초 |
+| `--tts-say-location` | `.env TTS_SAY_LOCATION` (없으면 끔) | 방송 문구 앞에 장소명을 넣는다 |
 
 ### 색상 판정
 
@@ -420,6 +428,7 @@ python3 tests/test_mosaic.py            # 픽셀화/머리영역/YuNet 폴백 (Y
 python3 tests/test_person_reid.py       # 재식별 갤러리 규칙 (가짜 임베더, 모델 불필요)
 python3 tests/test_trt_backend.py       # torch 없는 백엔드: ByteTrack 단위 + torch 미적재 확인 + ultralytics와 일치
 python3 tests/test_srt_push.py          # SRT 송출: 로컬 루프백 수신 + streamid + 자동 재연결 (서버 불필요)
+python3 tests/test_event_sender.py      # 이벤트 전송: 가짜 API로 전송/큐 보관/재전송/중복/격리/상한 (서버 불필요)
 python3 tests/test_tts_offline.py       # 문구/실시간 합성/캐시/재생큐/쿨다운/폴백 (모델·스피커 불필요)
 python3 tests/test_monitor_tts_hook.py  # YOLO 스텁으로 낮/적외선/저조도/모자이크/재식별 발화→색상→방송 전 경로 (ultralytics 불필요)
 python3 tests/test_stream_recorder.py   # 입력 종류 판정/파일 EOF/영상 분할·보존·디스크 가드 (카메라·네트워크 불필요)
@@ -484,6 +493,44 @@ python3 tests/test_stream_recorder.py   # 입력 종류 판정/파일 EOF/영상
 - Orin Nano에는 **영상 인코더 하드웨어(NVENC)가 없다** (디코더만, 보드 실측) → x264 소프트웨어 인코딩
 - JetPack GStreamer(1.20.3)의 srtsink은 실서버 연결 시 SIGSEGV → [srt_sender.py](srt_sender.py)가 libsrt-gnutls를 ctypes로 직접 호출
 - 서버 쪽 UDP 8890이 닫혀 있으면 감시는 계속 돌고 송출만 5→30초 백오프로 재시도
+
+### 관제 서버 이벤트 전송 (2026-09-24)
+
+- `--report`: 이벤트를 `jetson_handoff.md` §3 계약대로 서버 API에 전송 ([event_sender.py](event_sender.py))
+  - `POST /api/events` (JSON, Bearer 장비토큰) → `POST /api/events/{id}/media` (스냅샷 multipart) 순서
+  - `event_id`는 ULID — 오프라인 중 생성해도 충돌 없고, 재전송 시 서버가 중복 제거
+  - `person_bbox_at_drop`(투기자 마지막 목격 위치), `announce.played/phrase/suppressed_reason`(방송 결과) 포함
+- **유실 방지**: 전송 전 디스크 큐(`output/queue/events/*.json`, 원자적 쓰기)에 먼저 넣고,
+  실패·회선 끊김 시 5초→5분 지수 백오프로 오래된 것부터 무한 재전송. 종료 시 남은 건 다음 실행 때 이어서
+- 401(토큰 오류)은 보관·재시도, 400/403/422(계약 위반)는 `queue/events/bad/`로 격리해 큐를 막지 않음
+- 큐 상한 5,000건·디스크 여유 부족 시 오래된 것부터 폐기하고 `queue_full` 보고 (하트비트 연계용 `issues()`)
+- 외부 의존성 없음 (urllib) — 감시 루프는 절대 막히지 않는다 (백그라운드 스레드)
+
+### 서버 요청 반영: ROI·회수·클립·썸네일 (2026-10-04)
+
+`--report`면 모두 기본으로 켜진다. 끄려면 각 옵션에 0.
+
+- **ROI 원격 설정** ([roi.py](roi.py)): 하트비트 본문 `config.roi_version`으로 적용 버전을 알리고,
+  응답 버전이 더 크면 `GET /api/device/config` → `config/roi.json` 원자적 저장 → 즉시 적용 →
+  `POST /api/device/config/ack`. 잘못된 문서는 `ok:false`+사유로 ack하고 기존 구역을 유지한다
+  (같은 버전은 다시 받지 않음). 서버 없이도 마지막 `config/roi.json`으로 동작, 없으면 화면 전체.
+  - 판정: bbox 하단 중앙, exclude 우선, include가 없으면 전체 (대시보드 `isMonitored`와 동일)
+  - 구역 밖 물체는 발화하지 않는다. 구역이 바뀌어 **새로 감시 안에 든 기존 물체는 적치물로** 돌려
+    구역 변경만으로 사건이 나지 않게 한다. 송출 영상에 구역 외곽선(감시 초록·제외 빨강)을 그린다
+    (반투명 채우기는 2560x1440에서 구역당 ~7ms라 생략)
+- **회수 보고** ([retrieval.py](retrieval.py)): 사건 후 `--retrieve-window-min`(10분) 안에 그 자리의
+  물체가 사라지고 `--retrieve-confirm-sec`(120초) 동안 다시 안 보이면 `POST /api/events/{id}/update`
+  `{"update":"retrieved","after_s":…}`. 사람이 가리고 있는 시간·스트림 공백은 부재로 세지 않는다.
+  재시작하면 판정 중이던 사건은 잊는다 (오보고보다 누락 쪽)
+- **전후 클립** ([clip.py](clip.py)): 주석 프레임(모자이크본)을 720p JPEG 링버퍼(~10MB)에 두었다가
+  사건 앞뒤 `--clip-sec`(10초)를 x264 constrained-baseline mp4로 인코딩(nice 10, 20초 분량 ~4초)해
+  `clip` 파트로 따로 업로드. 이벤트 JSON `media`에 `clip`·`clip_range_s` 포함
+- **썸네일**: `--thumbnail-sec`(5초)마다 640x360 JPEG를 `PUT /api/devices/{id}/thumbnail`
+- **GPU 사용률**: `/sys/.../gpu/load`는 순간값이라 추론 사이에 읽으면 0 (표본 절반이 0, 보드 실측)
+  → 하트비트 주기 동안 1초마다 읽은 평균을 보낸다
+- **보존 기간**: 증거 파일을 `--keep-days`(90일), 원본 `*_raw.jpg`는 `--raw-keep-days`(30일) 지나면 삭제
+- 검증: `python3 tests/test_roi_followups.py` (보드 루트 여유가 2GB 미만이면 `TMPDIR=/dev/shm`으로 —
+  큐의 디스크 가드가 테스트 큐를 지운다)
 
 ### torch 없는 백엔드 (2026-09-21, 브랜치 `torch-free-backend`)
 

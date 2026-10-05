@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """사람 재식별(Re-ID) — 트래커 위에 얹는 외형 갤러리 층.
 
-트래커(ByteTrack)는 IoU+칼만 필터라 사람이 화면 밖으로 나갔다 돌아오면 새 id를 준다.
+트래커(BoT-SORT/ByteTrack)는 사라진 트랙을 track_buffer(30프레임)만 기억하므로 사람이 화면 밖으로
+나갔다 돌아오면 새 id를 준다 (BoT-SORT의 외형 매칭도 IoU가 겹치는 쌍에만 적용된다).
 이 모듈은 사람마다 외형 임베딩(yolo26n-reid, 512차원)을 트랙 전체에 걸쳐 평균해 두었다가,
 새 트랙이 나타나면 "최근 사라진 사람들"(갤러리)과 비교해 같은 사람이면 **이전 id를 돌려준다**.
 
@@ -16,6 +17,7 @@ owner_pid가 끊기면 "owner 부재" 판정과 회수 귀속이 틀어진다.
   4. 병합되면 호출자는 merges 목록으로 owner_pid / carried 키를 옛 id로 옮긴다
 
 연산: 사람당 EMBED_EVERY 프레임마다 1회, 한 프레임의 크롭은 배치로 한 번에 추론.
+      트래커가 BoT-SORT면 그쪽이 매 프레임 구한 임베딩을 넘겨받아 추론하지 않는다.
 모델은 models/yolo26n-reid.{engine,onnx} 순으로 찾는다 (engine은 convert_tensorrt.sh가 생성).
 """
 import time
@@ -121,8 +123,14 @@ class PersonReID:
     def enabled(self):
         return self.enc is not None
 
+    def canonical(self, raw):
+        """트래커 id -> 재식별로 합쳐진 대표 id (병합된 적 없으면 그대로)."""
+        return self.alias.get(raw, raw)
+
     # ------------------------------------------------------------------
-    def update(self, frame, persons, frame_idx, now=None):
+    def update(self, frame, persons, frame_idx, now=None, embs=None):
+        """embs: {raw_pid: 임베딩} — 트래커(BoT-SORT)가 이번 프레임에 이미 구했으면 그걸 쓴다.
+        None이면 직접 추론한다."""
         if not self.enabled:
             return list(persons), []
         now = time.monotonic() if now is None else now
@@ -137,7 +145,10 @@ class PersonReID:
                 todo.append((raw, box))             # 새 트랙: 매 프레임
             elif raw in self.pending or frame_idx % self.embed_every == 0:
                 todo.append((raw, box))
-        embs = self._embed(frame, todo) if todo else {}
+        if embs is not None:
+            embs = {raw: embs[raw] for raw, _ in todo if raw in embs}
+        else:
+            embs = self._embed(frame, todo) if todo else {}
 
         # 2) 트랙 갱신 / 새 트랙 등록
         active = set()

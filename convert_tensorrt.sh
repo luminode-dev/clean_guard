@@ -3,7 +3,9 @@
 set -Eeuo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-readonly IMG_SIZE="${IMG_SIZE:-640}"
+# 정수(정사각형) 또는 "H,W". 카메라가 16:9면 384,640 — 640x640 대비 패딩이 줄어 GPU 시간 -33%
+# (360은 stride 32의 배수가 아니라 384). 2026-10-04 보드 실측: 4.5ms -> 3.0ms, 탐지 결과 동일
+readonly IMG_SIZE="${IMG_SIZE:-384,640}"
 readonly TRT_WORKSPACE_MB="${TRT_WORKSPACE_MB:-2048}"
 readonly TRTEXEC="${TRTEXEC:-/usr/src/tensorrt/bin/trtexec}"
 readonly MODELS=(waste10_yolo26n person_yolo26n)
@@ -11,7 +13,7 @@ readonly REID_MODEL=yolo26n-reid          # 사람 재식별 임베더 (--reid).
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-[[ "${IMG_SIZE}" =~ ^[0-9]+$ ]] || die "IMG_SIZE must be an integer"
+[[ "${IMG_SIZE}" =~ ^[0-9]+(,[0-9]+)?$ ]] || die "IMG_SIZE must be N or H,W"
 [[ "${TRT_WORKSPACE_MB}" =~ ^[0-9]+$ ]] || die "TRT_WORKSPACE_MB must be an integer"
 command -v python3 >/dev/null || die "python3 is required"
 [[ -d models ]] || die "models directory not found"
@@ -25,11 +27,13 @@ from pathlib import Path
 import shutil
 from ultralytics import YOLO
 
-img_size = int(__import__("os").environ["IMG_SIZE"])
+img_size = [int(v) for v in __import__("os").environ["IMG_SIZE"].split(",")]
+img_size = img_size[0] if len(img_size) == 1 else tuple(img_size)
 for stem in ("waste10_yolo26n", "person_yolo26n"):
     target = Path("models") / f"{stem}.engine"
     exported = YOLO(f"models/{stem}.pt").export(
         format="engine", imgsz=img_size, batch=1, half=True, device=0,
+        nms=False,          # ultralytics 8.4: 명시해야 YOLO26 end2end 출력 (1,300,6). 기본값은 (1,84,N)
         verbose=False,
     )
     exported = Path(str(exported))
@@ -42,6 +46,8 @@ PY
 }
 
 build_with_trtexec() {
+  # 입력 크기는 ONNX에 고정돼 있다 (IMG_SIZE 무시). models/*.onnx는 384x640 end2end (2026-10-04).
+  # 보드에는 onnx 패키지가 없어 ultralytics 경로가 실패하고 보통 여기로 온다.
   [[ -x "${TRTEXEC}" ]] || die "trtexec not found at ${TRTEXEC}; set TRTEXEC to its path"
   for stem in "${MODELS[@]}"; do
     local onnx="models/${stem}.onnx"

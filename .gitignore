@@ -18,5 +18,9 @@ cache/
 # 실행 산출물
 output/
 
+# 대시보드에서 받아 온 감시 구역·설치 위치 (현장 상태 — roi.py / site_config.py가 관리)
+config/roi.json
+config/site.json
+
 __pycache__/
 *.pyc

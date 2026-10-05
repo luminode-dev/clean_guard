@@ -19,6 +19,7 @@ usage:
   prerender_tts.py --list                  # 만들 문구 목록만 출력
 """
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -54,9 +55,10 @@ def main():
     ap.add_argument("--backend", default="supertonic", choices=["supertonic", "null"])
     ap.add_argument("--model", default="supertonic-2")
     ap.add_argument("--model-dir", default=None, help="모델 폴더 (기본 ~/.cache/supertonic*)")
-    ap.add_argument("--voice", default="M4", help="M1~M5 / F1~F5")
+    ap.add_argument("--voice", default="F2", help="M1~M5 / F1~F5")
     ap.add_argument("--lang", default="ko")
-    ap.add_argument("--steps", type=int, default=8, help="디노이징 스텝")
+    ap.add_argument("--steps", type=int, default=int(os.environ.get("TTS_STEPS") or 8),
+                    help="디노이징 스텝 (기본 .env TTS_STEPS, 없으면 8 — 실시간 방송과 같게)")
     ap.add_argument("--speed", type=float, default=1.0)
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--location", default=None, help="방송에 넣을 장소명")
