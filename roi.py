@@ -35,11 +35,17 @@ def point_in_polygon(x, y, poly):
     return inside
 
 
+def is_excluded(bbox, frame_w, frame_h, zones):
+    """bbox(x1,y1,x2,y2 픽셀)의 하단 중앙이 제외 구역 안인가."""
+    x, y = (bbox[0] + bbox[2]) / 2 / frame_w, bbox[3] / frame_h
+    return any(point_in_polygon(x, y, z["points"]) for z in zones if z["type"] == "exclude")
+
+
 def is_monitored(bbox, frame_w, frame_h, zones):
     """bbox(x1,y1,x2,y2 픽셀)의 하단 중앙이 감시 대상인가."""
-    x, y = (bbox[0] + bbox[2]) / 2 / frame_w, bbox[3] / frame_h
-    if any(point_in_polygon(x, y, z["points"]) for z in zones if z["type"] == "exclude"):
+    if is_excluded(bbox, frame_w, frame_h, zones):
         return False
+    x, y = (bbox[0] + bbox[2]) / 2 / frame_w, bbox[3] / frame_h
     inc = [z for z in zones if z["type"] == "include"]
     return not inc or any(point_in_polygon(x, y, z["points"]) for z in inc)
 
@@ -149,4 +155,4 @@ class RoiConfig(RemoteConfig):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4 * th, color, max(1, th // 2))
 
 
-__all__ = ["RoiConfig", "is_monitored", "point_in_polygon", "validate"]
+__all__ = ["RoiConfig", "is_excluded", "is_monitored", "point_in_polygon", "validate"]

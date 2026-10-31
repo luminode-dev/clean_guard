@@ -175,14 +175,23 @@ class OutputSpace:
 
     공간과 별개로 expire()는 보존 기간이 지난 증거를 지운다 (handoff §3.3 기준안:
     모자이크본 90일, 원본(*_raw.*) 30일). 0이면 기간 삭제 안 함.
+
+    protect: 지우면 안 되는 경로 집합을 돌려주는 함수 (EventSender.pending_media — 서버가
+    size·sha256을 확인해 주기 전의 스냅샷·클립·음성). 공간 회수·기간 삭제 모두 건너뛴다.
+    여유가 기준 미만인 보드에서 사건마다 회수가 돌아 미전송 증거를 지우던 문제 (2026-10-24).
+    만든 지 FRESH_S 안 된 증거도 회수하지 않는다 — 방송 음성(재생 뒤 첨부)·클립(사건 5초 뒤 인코딩)은
+    파일이 생기고 큐에 들어가기까지 틈이 있어 protect만으로는 못 막는다.
     """
 
     VIDEO_GLOB = "annotated_*.mp4"
     EVENT_GLOB = "event_*.*"            # 스냅샷 jpg + 클립 mp4 + 방송 음성 wav (events.jsonl은 안 걸림)
+    FRESH_S = 600.0                     # 이보다 새 증거는 아직 첨부 전일 수 있다
 
     def __init__(self, out_dir, min_free_mb=1000.0, headroom_mb=200.0,
-                 purge_order="video-first", keep_days=90.0, raw_keep_days=30.0):
+                 purge_order="video-first", keep_days=90.0, raw_keep_days=30.0,
+                 protect=None):
         self.dir = Path(out_dir)
+        self.protect = protect
         self.min_free_mb = float(min_free_mb)
         # 임계선에 딱 맞춰 멈추면 곧바로 다시 걸리므로 조금 더 확보하고 끝낸다
         self.target_mb = self.min_free_mb + max(0.0, float(headroom_mb))
@@ -193,11 +202,21 @@ class OutputSpace:
         self.keep_days, self.raw_keep_days = float(keep_days), float(raw_keep_days)
         self.n_expired = 0
 
-    def _by_age(self, glob, exclude):
+    def _protected(self):
+        if self.protect is None:
+            return set()
+        try:
+            return self.protect()
+        except Exception:                                   # noqa: BLE001 — 모르면 지우지 않는다
+            return None
+
+    def _by_age(self, glob, exclude, protected=frozenset()):
         """glob에 걸리는 파일을 오래된 순으로. (mtime, path) 목록."""
         out = []
         for p in self.dir.glob(glob):
             if exclude is not None and p == exclude:
+                continue
+            if protected and p.resolve() in protected:
                 continue
             try:
                 out.append((p.stat().st_mtime, p))
@@ -208,7 +227,10 @@ class OutputSpace:
     def _candidates(self, exclude=None):
         """삭제 후보를 지울 순서대로. exclude는 현재 기록 중인 파일."""
         videos = self._by_age(self.VIDEO_GLOB, exclude)
-        events = self._by_age(self.EVENT_GLOB, exclude)
+        protected = self._protected()
+        events = [] if protected is None else self._by_age(self.EVENT_GLOB, exclude, protected)
+        fresh = time.time() - self.FRESH_S
+        events = [(m, p) for m, p in events if m < fresh]
         if self.purge_order == "oldest-first":
             return [p for _, p in sorted(videos + events)]
         return [p for _, p in videos] + [p for _, p in events]
@@ -247,7 +269,10 @@ class OutputSpace:
         """보존 기간이 지난 증거 파일(스냅샷·클립·방송 음성)을 지운다. 삭제 수 반환."""
         now = time.time() if now is None else now
         n = 0
-        for mtime, p in self._by_age(self.EVENT_GLOB, exclude):
+        protected = self._protected()
+        if protected is None:
+            return 0
+        for mtime, p in self._by_age(self.EVENT_GLOB, exclude, protected):
             days = self.raw_keep_days if "_raw." in p.name else self.keep_days
             if days <= 0 or now - mtime < days * 86400:
                 continue

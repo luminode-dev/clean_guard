@@ -502,7 +502,7 @@ with tempfile.TemporaryDirectory() as td:
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     FakeAPI.events, FakeAPI.media, FakeAPI.mode = [], [], "ok"
     # load_env_file은 setdefault라 미리 넣은 환경변수가 .env보다 우선한다
-    os.environ.update(API_URL=f"http://127.0.0.1:{RPT_PORT}", DEVICE_TOKEN=TOKEN,
+    os.environ.update(API_URL=f"http://127.0.0.1:{RPT_PORT}", CG_DEVICE_TOKEN=TOKEN,
                       DEVICE_ID="JT-GN-0001", SITE_ID="SITE-GN-0001")
     # 썸네일(PUT)은 test_roi_followups.py에서 따로 본다 — 여기 가짜 서버는 PUT이 없다
     events, got_calls, ann = run_scenario(td, "day", name="report",
@@ -577,6 +577,70 @@ check("이번 프레임 탐지가 있으면 그 사람 우선", o.owner_pid, 3)
 o = dm.WasteObject(bag, 0, 0.5, 50, None)
 how = dm.link_owner(o, bag, 0, None, [], {}, 50, recent=[(7, [300, 60, 350, 200])])
 check("멀리 있던 사람은 연결 안 함", (o.owner_pid, o.person_at_birth), (None, False))
+
+print("\n9) 정지 판정: 큰 박스가 천천히 끌려가면 정지가 아니다 (10/10 리어카 오탐 회귀)")
+frame720 = np.zeros((720, 1280, 3), np.uint8)
+
+
+def drag(w, h, px_per_frame, frames=40, start=50):
+    """w x h 박스를 프레임당 px_per_frame씩 오른쪽으로 옮기며 seen()을 부른다. 마지막 정지 프레임 수."""
+    box = [100, 300, 100 + w, 300 + h]
+    o = dm.WasteObject(list(box), 0, 0.5, start, None)
+    for f in range(start + 1, start + frames + 1):
+        dx = px_per_frame * (f - start)
+        o.seen([box[0] + dx, box[1], box[2] + dx, box[3]], 0.5, f, None, frame=frame720)
+    return start + frames - o.still_since, o
+
+
+still, _ = drag(300, 200, 5)                    # 50px/s — 예전엔 정지로 통과
+check_true("300x200 박스 50px/s는 이동 중", still < dm.STATIC_FRAMES, f"정지 {still}프레임")
+still, _ = drag(300, 200, 0)
+check_true("300x200 박스 제자리는 정지", still >= dm.STATIC_FRAMES, f"정지 {still}프레임")
+still, _ = drag(80, 60, 0.5)                    # 작은 물체의 탐지 흔들림 수준
+check_true("작은 박스 미세 흔들림은 정지", still >= dm.STATIC_FRAMES, f"정지 {still}프레임")
+_, o = drag(300, 200, 0, frames=5)
+o.clear_count = 7
+o.seen([200, 300, 500, 500], 0.5, 60, None, frame=frame720)      # 투기자 이탈 확인 중에 움직임
+check("이탈 확인 중 움직이면 부재 카운트 초기화", o.clear_count, 0)
+
+print("\n10) LOST에서 되찾은 물체는 정지·부재 판정을 처음부터 (10/10 #116: 재식별 4프레임 만에 발화)")
+_, o = drag(80, 100, 0, frames=40)              # 오래 정지해 있던 물체
+o.clear_count = 8
+check_true("되찾기 전엔 정지 충족", 90 - o.still_since >= dm.STATIC_FRAMES)
+o.seen([102, 300, 182, 400], 0.5, 200, None, frame=frame720)    # 한참 뒤 거의 같은 자리에서 재식별
+o.restart_still(200)
+check("정지 시작 = 되찾은 프레임", o.still_since, 200)
+check("부재 카운트 초기화", o.clear_count, 0)
+
+print("\n11) 배경 비교는 등장 시점 배경으로 (10/31 자전거 그림자: 늦게 발화하면 비교가 건너뛰어졌음)")
+from collections import deque                                       # noqa: E402
+
+rng = np.random.default_rng(1)
+bg = rng.integers(90, 160, (720, 1280), dtype=np.uint8)
+shadow = bg.copy()
+shadow[369:395, 924:977] //= 3                                       # 원래부터 있던 그림자
+sbox = [924, 369, 977, 395]
+
+
+def birth(gray_before, first_seen=100):
+    buf = deque(((f, gray_before, []) for f in range(first_seen - 45, first_seen + 1)), maxlen=50)
+    o = dm.WasteObject(list(sbox), 0, 0.16, first_seen, None)
+    o.bg_ref = dm.background_ref(sbox, first_seen, buf, deque(maxlen=dm.BG_LONG_KEEP))
+    return o
+
+
+o = birth(shadow)
+check_true("오래 있던 그림자: 등장 900프레임 뒤 발화 판정에서도 적치물", dm.region_unchanged(shadow, o))
+o = birth(bg)
+check_true("진짜 새로 놓인 물체: 배경과 다르므로 발화 허용", not dm.region_unchanged(shadow, o))
+o = dm.WasteObject(list(sbox), 0, 0.5, 3, None)
+o.bg_ref = dm.background_ref(sbox, 3, deque([(1, bg, []), (2, bg, []), (3, shadow, [])]), deque())
+check_true("스트림 시작 직후 등장은 적치물", dm.region_unchanged(shadow, o))
+cover = [(1, [900, 300, 1000, 420])]                                # 등장 전 5초 내내 사람이 가림
+buf = deque(((f, bg, cover) for f in range(55, 101)), maxlen=50)
+o = dm.WasteObject(list(sbox), 0, 0.5, 100, None)
+o.bg_ref = dm.background_ref(sbox, 100, buf, deque([(50, shadow, [])]))
+check_true("짧은 버퍼가 다 가려졌으면 장기 배경으로 비교", dm.region_unchanged(shadow, o))
 
 print()
 if fails:

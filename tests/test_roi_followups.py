@@ -33,7 +33,7 @@ import heartbeat                                              # noqa: E402
 from heartbeat import Heartbeat, SystemProbe, ThumbnailUploader   # noqa: E402
 from recorder import OutputSpace                              # noqa: E402
 from retrieval import RetrievalWatch                          # noqa: E402
-from roi import RoiConfig, crop_rect, is_monitored, validate             # noqa: E402
+from roi import RoiConfig, crop_rect, is_excluded, is_monitored, validate             # noqa: E402
 from test_event_sender import TOKEN, FakeAPI, make_sender, sample_event, wait_until  # noqa: E402
 
 PORT = 18010            # make_sender()가 이 포트를 쓴다
@@ -106,6 +106,10 @@ def test_rules():
     only_exc = [z for z in zones if z["type"] == "exclude"]
     check("include 없으면 전체 감시", is_monitored([1100, 600, 1200, 700], W, H, only_exc))
     check("구역 없음 = 전체", is_monitored([0, 0, 10, 10], W, H, []))
+    check("제외 구역 안 = 화면에서 숨김", is_excluded([500, 20, 560, 100], W, H, zones))
+    check("감시 구역 안은 숨기지 않음", not is_excluded([500, 300, 560, 400], W, H, zones))
+    check("감시 구역 밖이어도 제외 구역이 아니면 표시", not is_excluded([1100, 600, 1200, 700], W, H, zones))
+    check("구역 없음 = 숨김 없음", not is_excluded([0, 0, 10, 10], W, H, []))
 
     print("[1-1] 쓰레기 탐지 크롭 영역")
     sq = [{"type": "include", "points": [(0.5, 0.5), (0.7, 0.5), (0.7, 0.8), (0.5, 0.8)]}]

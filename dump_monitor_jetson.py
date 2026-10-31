@@ -45,7 +45,7 @@ from mosaic import FaceMosaic
 from person_reid import PersonReID, load_encoder as load_reid_encoder
 from event_sender import ulid
 from recorder import OutputSpace, RotatingRecorder
-from roi import RoiConfig, crop_rect, is_monitored
+from roi import RoiConfig, crop_rect, is_excluded, is_monitored
 from site_config import SiteConfig
 from stream import FrameSource
 
@@ -79,16 +79,22 @@ CARRY_WINDOW = 60        # 소지품 목격 후 귀속 후보로 보는 프레�
 NEAR_FACTOR = 2.0        # 사람-객체 근접 판정: 객체 대각선의 N배
 BIRTH_WINDOW = 40        # 사람 이력·배경 비교용 과거 프레임 보관 길이 (귀속 판정에는 안 씀)
 DEDUP_IOU = 0.6          # 클래스 무관 탐지 중복 제거 임계
-CLEAR_FRAMES = 5         # 사람 부재 연속 프레임 후 발화
-STATIC_FRAMES = 20       # 발화 전 제자리에 멈춰 있어야 하는 최소 프레임 (~1.3s @15fps)
+CLEAR_FRAMES = 10        # 투기자 부재 + 물체 정지가 함께 이어져야 하는 연속 프레임 (1s @10fps)
+                         # 그 사이 물체가 움직이면 처음부터 다시 센다 (아래 WasteObject.seen)
+STATIC_FRAMES = 20       # 발화 전 제자리에 멈춰 있어야 하는 최소 프레임 (2s @10fps)
 STATIC_TOL = 0.3         # 기준 위치에서 중심이 객체 대각선의 이 비율 넘게 벗어나면 '이동 중'
                          # -> 사람과 함께 움직이는 물체(우산·가방)는 버려진 것이 아니다 (2026-09-26 오탐)
+STATIC_MAX_FRAC = 0.02   # 단, 허용 거리는 프레임 대각선의 이 비율을 넘지 않는다 (720p 약 29px)
+                         # 대각선 비례만 쓰면 큰 박스는 천천히 끌려가도 '정지'가 된다 (2026-10-10 리어카 오탐)
 LOST_LINK_FRAMES = 10    # 탐지가 빠진 지 이 프레임 이내인 사람은 칼만 예측 위치에 '있는' 것으로 본다
                          # (귀속·투기자 근처 판정. 사람 탐지 깜빡임 한 번에 투기자를 놓치지 않게)
 ROI_GRACE = 5            # 구역 변경 후 이 프레임 안에 처음 잡힌 물체는 원래 있던 것으로 본다
                          # (구역을 넓히면 그 자리에 놓여 있던 쓰레기가 '새로' 탐지되므로)
 BG_MIN_GAP = 5           # 배경 비교: 등장 최소 N프레임 전 프레임과 대조
 BG_MAD_THRESH = 0.05     # 영역 평균절대차(0~1)가 이보다 작으면 '원래 있던 물체'로 간주
+BG_REF_PAD = 0.5         # 등장 시 떼어 두는 배경 조각 여유 (박스 크기 비율) — 발화 때 박스가 조금 밀려도 비교 가능
+BG_LONG_EVERY = 50       # 장기 배경: 이 프레임마다 한 장 보관 (5s @10fps)
+BG_LONG_KEEP = 6         # 장기 배경 보관 장수 (30s) — 등장 직전 몇 초가 전부 사람에 가려졌을 때 쓴다
                          # (야간 저대비에서 실제 투기까지 억제하지 않도록 보수적으로 설정)
 
 WASTE_NAMES = ["쓰레기봉투", "대형가구", "가전제품", "페트", "캔", "병",
@@ -96,6 +102,11 @@ WASTE_NAMES = ["쓰레기봉투", "대형가구", "가전제품", "페트", "캔
 
 
 ENV_FILE = Path(os.environ.get("CLEAN_GUARD_ENV") or (HERE / ".env"))
+
+
+def device_token():
+    """장비 토큰: CG_DEVICE_TOKEN (서버 문서 이름), 없으면 예전 이름 DEVICE_TOKEN."""
+    return (os.environ.get("CG_DEVICE_TOKEN") or os.environ.get("DEVICE_TOKEN") or "").strip()
 
 
 def load_env_file(path=None):
@@ -311,28 +322,48 @@ def hist_sim(h1, h2):
     return float(cv2.compareHist(h1, h2, cv2.HISTCMP_CORREL))
 
 
-def region_unchanged(frame_gray, obj, frame_buffer):
-    """객체 등장 이전의 과거 프레임과 현재 프레임에서 객체 영역을 비교.
+def background_ref(box, first_seen, frame_buffer, bg_long):
+    """물체가 처음 잡힌 순간, 나중에 발화 판정 때 비교할 '등장 전' 배경 조각을 떼어 둔다.
+
+    발화는 등장 후 수 초~수십 초 뒤라 그때 frame_buffer(5초)에는 등장 전 프레임이 이미 없다.
+    예전엔 발화 시점에 버퍼를 뒤져서, 늦게 발화하는 물체는 배경 비교가 통째로 건너뛰어졌다
+    (2026-10-31 자전거 그림자 오탐). 반환: (x0, y0, gray 조각) / "start"(스트림 시작 직후) / None"""
+    # 짧은 버퍼는 오래된 것부터(기존 기준), 그래도 다 가려졌으면 장기 배경을 최근 것부터
+    cands = ([e for e in frame_buffer if e[0] <= first_seen - BG_MIN_GAP]
+             + [e for e in reversed(bg_long) if e[0] <= first_seen - BG_MIN_GAP])
+    if not cands:
+        return "start" if first_seen <= BG_MIN_GAP + 2 else None
+    h, w = cands[0][1].shape[:2]
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    x1, y1 = max(0, int(box[0] - bw * BG_REF_PAD)), max(0, int(box[1] - bh * BG_REF_PAD))
+    x2, y2 = min(w, int(box[2] + bw * BG_REF_PAD)), min(h, int(box[3] + bh * BG_REF_PAD))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    for fi, gray, plist in cands:
+        if any(iou(box, pb) > 0.05 for _, pb in plist):
+            continue
+        return x1, y1, gray[y1:y2, x1:x2].copy()
+    return None            # 등장 전 프레임마다 사람이 있었으면 판단 보류(발화 허용)
+
+
+def region_unchanged(frame_gray, obj):
+    """등장 시 떼어 둔 배경 조각(obj.bg_ref)과 현재 프레임에서 객체 영역을 비교.
     거의 같으면(True) '원래 있던 물체'가 뒤늦게 탐지된 것 -> 발화 금지."""
-    x1, y1, x2, y2 = map(int, obj.box)
-    x1, y1 = max(0, x1), max(0, y1)
+    ref = obj.bg_ref
+    if ref == "start":
+        return True        # 영상/스트림 시작 직후 등장 -> 새 물체라는 증거가 없으니 기존 적치물 취급
+    if ref is None:
+        return False
+    x0, y0, old = ref
+    x1, y1 = max(x0, int(obj.box[0])), max(y0, int(obj.box[1]))
+    x2 = min(x0 + old.shape[1], int(obj.box[2]), frame_gray.shape[1])
+    y2 = min(y0 + old.shape[0], int(obj.box[3]), frame_gray.shape[0])
     if x2 - x1 < 4 or y2 - y1 < 4:
         return False
     cur = frame_gray[y1:y2, x1:x2]
-    pre = [e for e in frame_buffer if e[0] <= obj.first_seen - BG_MIN_GAP]
-    if not pre:
-        # 영상/스트림 시작 직후 등장 -> 새 물체라는 증거가 없으니 기존 적치물 취급
-        return obj.first_seen <= BG_MIN_GAP + 2
-    # 사람이 그 영역에 없던 가장 오래된 프레임과 비교
-    for fi, gray, plist in pre:
-        if any(iou(obj.box, pb) > 0.05 for _, pb in plist):
-            continue
-        old = gray[y1:y2, x1:x2]
-        if old.shape != cur.shape or old.size == 0:
-            continue
-        mad = float(np.mean(np.abs(cur.astype(np.int16) - old.astype(np.int16)))) / 255.0
-        return mad < BG_MAD_THRESH
-    return False           # 과거 프레임마다 사람이 있었으면 판단 보류(발화 허용)
+    old = old[y1 - y0:y2 - y0, x1 - x0:x2 - x0]
+    mad = float(np.mean(np.abs(cur.astype(np.int16) - old.astype(np.int16)))) / 255.0
+    return mad < BG_MAD_THRESH
 
 
 def held_overhead(obj_box, pbox):
@@ -452,6 +483,7 @@ class WasteObject:
         self.owner_strong = False
         self.fired = False
         self.clear_count = 0
+        self.bg_ref = None          # 등장 전 배경 조각 (background_ref) — 생성 직후 채운다
         self.last_reason = None     # 판정 로그(--log-objects) 중복 방지
         # 방송 색상은 '가장 확신했던 프레임'의 크롭에서 뽑는다 (발화 프레임 1장보다 안정적)
         self.best_conf = -1.0
@@ -470,13 +502,23 @@ class WasteObject:
     def seen(self, box, conf, frame_idx, hist, frame=None):
         self._update_crop(frame, box, conf)
         cx, cy = center(box)
-        if ((cx - self.anchor[0]) ** 2 + (cy - self.anchor[1]) ** 2) ** 0.5 \
-                > STATIC_TOL * max(diag(box), 20):
+        tol = STATIC_TOL * max(diag(box), 20)
+        if frame is not None:
+            fh, fw = frame.shape[:2]
+            tol = min(tol, STATIC_MAX_FRAC * (fw ** 2 + fh ** 2) ** 0.5)
+        if ((cx - self.anchor[0]) ** 2 + (cy - self.anchor[1]) ** 2) ** 0.5 > tol:
             self.anchor, self.still_since = (cx, cy), frame_idx
+            self.clear_count = 0        # 투기자가 떠난 뒤에도 움직였다 = 누가 끌고 가는 중
         self.box, self.conf, self.last_seen = box, conf, frame_idx
         self.age += 1
         if hist is not None:
             self.hist = hist if self.hist is None else 0.7 * self.hist + 0.3 * hist
+
+    def restart_still(self, frame_idx):
+        """LOST에서 되찾은 물체: 안 보이던 동안 어디 있었는지 모르므로 정지·부재 판정을 처음부터.
+        옛 기록을 물려받으면 지나가던 리어카 짐이 재식별되자마자 '오래 정지'로 발화한다 (2026-10-10 오탐)."""
+        self.anchor, self.still_since = center(self.box), frame_idx
+        self.clear_count = 0
 
 
 def main():
@@ -501,7 +543,7 @@ def main():
                          ".env의 SRT_HOST/SRT_STREAMID 필요. 끊기면 자동 재연결")
     ap.add_argument("--report", action="store_true",
                     help="이벤트 JSON+스냅샷을 관제 서버 API로 전송 (event_sender.py). "
-                         ".env의 API_URL/DEVICE_TOKEN/DEVICE_ID/SITE_ID 필요. "
+                         ".env의 API_URL/CG_DEVICE_TOKEN/DEVICE_ID/SITE_ID 필요. "
                          "실패 시 디스크 큐에 보관 후 재전송 — 회선이 끊겨도 유실 없음")
     ap.add_argument("--heartbeat-sec", type=float, default=30.0,
                     help="--report 사용 시 장치 상태 하트비트 주기(초). 서버는 90초 미수신이면 "
@@ -652,6 +694,24 @@ def main():
     print(f"backend={backend.name} waste={Path(backend.waste_path).name} "
           f"person={Path(backend.person_path).name} -> {out_dir}")
 
+    # 서버 설정 검사는 스트림·송출 스레드를 띄우기 전에 한다 — 스레드가 산 채로
+    # ap.error()로 빠지면 'terminate called without an active exception'으로 코어 덤프된다
+    if args.push:
+        if not os.environ.get("SRT_HOST", "").strip() or not os.environ.get("SRT_STREAMID", "").strip():
+            ap.error(f"--push에는 {ENV_FILE}의 SRT_HOST와 SRT_STREAMID가 필요합니다"
+                     " (.env.example 참고)")
+        if os.environ["SRT_STREAMID"].strip().endswith(":송출비번"):
+            ap.error(f"{ENV_FILE}의 SRT_STREAMID 송출 비밀번호가 예시값 그대로입니다. "
+                     "서버 mediamtx accounts.txt의 실제 비밀번호를 넣을 것")
+    if args.report:
+        if not (os.environ.get("API_URL", "").strip() and device_token()
+                and os.environ.get("DEVICE_ID", "").strip() and os.environ.get("SITE_ID", "").strip()):
+            ap.error(f"--report에는 {ENV_FILE}의 API_URL, CG_DEVICE_TOKEN, "
+                     "DEVICE_ID, SITE_ID가 필요합니다 (.env.example 참고)")
+        if not device_token().isascii():    # .env.example의 '장비토큰' 그대로 — HTTP 헤더에 못 넣는다
+            ap.error(f"{ENV_FILE}의 CG_DEVICE_TOKEN이 예시값 그대로입니다. "
+                     "서버 device-tokens.txt의 실제 토큰을 넣을 것")
+
     try:
         src = FrameSource(args.source,
                           reconnect_delay=args.reconnect_delay,
@@ -688,9 +748,6 @@ def main():
         # 주소·자격은 .env에서 읽는다 (명령줄에 두면 ps·셸 이력에 남는다)
         srt_host = os.environ.get("SRT_HOST", "").strip()
         srt_sid = os.environ.get("SRT_STREAMID", "").strip()
-        if not srt_host or not srt_sid:
-            ap.error(f"--push에는 {ENV_FILE}의 SRT_HOST와 SRT_STREAMID가 필요합니다"
-                     " (.env.example 참고)")
         from srt_sender import SrtStreamer
         pusher = SrtStreamer(srt_host, int(os.environ.get("SRT_PORT", "8890")), srt_sid,
                              latency_ms=int(os.environ.get("SRT_LATENCY_MS", "200")))
@@ -700,28 +757,25 @@ def main():
     if args.report:
         # 토큰·식별자는 .env에서 읽는다 (jetson_handoff.md §1 — 코드·git에 넣지 말 것)
         api_url = os.environ.get("API_URL", "").strip()
-        api_token = os.environ.get("DEVICE_TOKEN", "").strip()
+        api_token = device_token()
         device_id = os.environ.get("DEVICE_ID", "").strip()
         site_id = os.environ.get("SITE_ID", "").strip()
-        if not (api_url and api_token and device_id and site_id):
-            ap.error(f"--report에는 {ENV_FILE}의 API_URL, DEVICE_TOKEN, "
-                     "DEVICE_ID, SITE_ID가 필요합니다 (.env.example 참고)")
         from event_sender import EventSender
         reporter = EventSender(api_url, api_token, device_id, site_id,
-                               queue_dir=Path(args.out) / "queue" / "events",
-                               min_free_mb=args.min_free_mb)
+                               queue_dir=Path(args.out) / "queue" / "events")
+        space.protect = reporter.pending_media      # 서버 확인 전 증거는 디스크 회수에서 제외
         n_queued = reporter.pending()
         print(f"[전송] {api_url} · 장치 {device_id}"
               + (f" · 이전 미전송 {n_queued}건 재시도" if n_queued else "")
               + " · 실패 시 큐 보관 후 재전송")
     roi = RoiConfig(args.roi_file,
                     base_url=os.environ.get("API_URL", "").strip() if reporter else None,
-                    token=os.environ.get("DEVICE_TOKEN", "").strip() if reporter else None)
+                    token=device_token() if reporter else None)
     print(f"[ROI] {roi.describe()}" + (" · 서버 설정 동기화" if reporter else "")
           + ("" if Path(args.roi_file).is_file() else f" ({Path(args.roi_file).name} 없음)"))
     site = SiteConfig(args.site_file,
                       base_url=os.environ.get("API_URL", "").strip() if reporter else None,
-                      token=os.environ.get("DEVICE_TOKEN", "").strip() if reporter else None,
+                      token=device_token() if reporter else None,
                       on_apply=lambda c: (announcer.set_location(place_name())
                                           if announcer else None))
 
@@ -740,7 +794,7 @@ def main():
     roi_changed_at = -ROI_GRACE - 1            # 마지막 구역 변경 프레임
     clipper = thumb = retrieval = None
     if reporter is not None:
-        api_url, api_token = os.environ["API_URL"].strip(), os.environ["DEVICE_TOKEN"].strip()
+        api_url, api_token = os.environ["API_URL"].strip(), device_token()
         if args.clip_sec > 0:
             from clip import EventClipper
             clipper = EventClipper(lambda eid, path: reporter.attach(eid, {"clip": path}),
@@ -771,6 +825,7 @@ def main():
     objects, carried = [], {}
     person_hist = deque(maxlen=BIRTH_WINDOW * 2)
     frame_buffer = deque(maxlen=BIRTH_WINDOW + 10)   # (frame_idx, gray, persons)
+    bg_long = deque(maxlen=BG_LONG_KEEP)             # 같은 형식, BG_LONG_EVERY마다 한 장
     n_events, frame_idx = 0, 0
     show_ready = False              # --show 창은 첫 프레임에서 한 번만 만든다
     # 하트비트가 읽는 감시 루프 값 (추론 시간은 지수이동평균 ms)
@@ -799,7 +854,7 @@ def main():
                           + ([] if str(backend.waste_path).endswith(".engine") else ["model_fallback"]),
             }
 
-        heartbeat = Heartbeat(os.environ["API_URL"].strip(), os.environ["DEVICE_TOKEN"].strip(),
+        heartbeat = Heartbeat(os.environ["API_URL"].strip(), device_token(),
                               os.environ["DEVICE_ID"].strip(), hb_collect,
                               interval=args.heartbeat_sec, roi=roi, configs=[site],
                               output_path=args.out)
@@ -839,6 +894,8 @@ def main():
                   if pid not in seen_pids]
         person_hist.append((frame_idx, list(persons)))
         frame_buffer.append((frame_idx, frame_gray, list(persons)))
+        if frame_idx % BG_LONG_EVERY == 0:
+            bg_long.append((frame_idx, frame_gray, list(persons)))
 
         ground_dets = []
         fh, fw = frame.shape[:2]
@@ -913,9 +970,11 @@ def main():
                     best, best_score = o, s
             if best is not None:
                 best.seen(box, conf, frame_idx, h, frame=frame)
+                best.restart_still(frame_idx)
                 matched.add(best.id)
                 continue
             o = WasteObject(box, cls, conf, frame_idx, h, frame=frame)
+            o.bg_ref = background_ref(box, frame_idx, frame_buffer, bg_long)
             if frame_idx - roi_changed_at <= ROI_GRACE:
                 o.baseline = True   # 구역이 막 바뀌어 보이기 시작한 물체 = 원래 있던 것
             how = link_owner(o, box, cls, h, persons, carried, frame_idx, recent)
@@ -1008,7 +1067,7 @@ def main():
                 o.fired = True
                 continue
             # 배경 차분: 등장 이전에도 그 자리에 같은 것이 있었다면 기존 적치물 -> 강등
-            if region_unchanged(frame_gray, o, frame_buffer):
+            if region_unchanged(frame_gray, o):
                 note(o, "등장 전에도 같은 자리에 있었음 (배경 동일) -> 적치물")
                 o.baseline = True
                 continue
@@ -1100,7 +1159,10 @@ def main():
         if (recorder.enabled or args.show or pusher is not None
                 or clipper is not None or thumb is not None):
             roi.draw(frame)
+            # 제외 구역 안의 탐지는 화면에 그리지 않는다 (판정은 위에서 이미 빠짐, 모자이크는 유지)
             for pid, p in persons:
+                if is_excluded(p, fw, fh, zones):
+                    continue
                 x1, y1, x2, y2 = map(int, p)
                 has_carry = pid in carried and frame_idx - carried[pid]["last_frame"] <= 5
                 color = (0, 120, 255) if has_carry else (0, 200, 0)
@@ -1108,7 +1170,7 @@ def main():
                 cv2.putText(frame, f"P{pid}{'*' if has_carry else ''}",
                             (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             for o in objects:
-                if frame_idx - o.last_seen > MISS_TOLERANCE:
+                if frame_idx - o.last_seen > MISS_TOLERANCE or is_excluded(o.box, fw, fh, zones):
                     continue
                 x1, y1, x2, y2 = map(int, o.box)
                 color = (0, 0, 255) if o.fired else ((180, 180, 180) if o.baseline

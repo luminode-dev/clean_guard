@@ -114,6 +114,33 @@ if DEFAULT_FACE_MODEL.exists() and hasattr(cv2, "FaceDetectorYN"):
 else:
     print(f"\n7) (건너뜀) YuNet 모델 없음 또는 cv2.FaceDetectorYN 미지원: {DEFAULT_FACE_MODEL}")
 
+print("\n8) 탐지기가 inf/NaN 박스를 내도 죽지 않는다 (10/27 OverflowError 회귀)")
+
+
+class _BadDetector:
+    """YuNet 대역: 정상 얼굴 1개 + inf/NaN 얼굴을 함께 돌려준다."""
+
+    def __init__(self, faces):
+        self.faces = np.array(faces, dtype=np.float32)
+
+    def setInputSize(self, size):
+        pass
+
+    def detect(self, crop):
+        return 1, self.faces
+
+
+inf, nan = float("inf"), float("nan")
+fm_bad = FaceMosaic(mode="head")
+fm_bad.mode = "face"
+fm_bad.detector = _BadDetector([[10, 10, 20, 20], [inf, 5, 10, 10], [5, nan, 10, 10]])
+img = noisy()
+check("유효 얼굴만 가림", fm_bad.apply(img, [[50, 40, 150, 220]]), 1)
+fm_bad.detector = _BadDetector([[inf, inf, inf, inf]])
+check("전부 무효면 head 폴백", fm_bad.apply(img, [[50, 40, 150, 220]]), 1)
+check("head 폴백 카운트", fm_bad.n_heads, 1)
+check("inf 사람 박스는 무시", pixelate(img, [0, 0, inf, inf]), False)
+
 print()
 if fails:
     print(f"실패 {len(fails)}건: {fails}")

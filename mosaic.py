@@ -13,6 +13,7 @@
 
 모델: models/face_detection_yunet_2023mar.onnx (약 230KB, opencv_zoo)
 """
+import math
 from pathlib import Path
 
 import cv2
@@ -34,6 +35,8 @@ MIN_BLOCK = 6            # 작은 얼굴도 최소 이 픽셀 크기의 블록�
 
 def _clamp(box, w, h):
     x1, y1, x2, y2 = box
+    if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+        return 0, 0, 0, 0          # inf/NaN 좌표는 빈 영역으로 (호출부가 무시)
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = min(w, int(x2)), min(h, int(y2))
     return x1, y1, x2, y2
@@ -98,6 +101,8 @@ def detect_faces_in(frame, pbox, detector, pad=PERSON_CROP_PAD):
         return []
     out = []
     for fx, fy, fw, fh in faces[:, :4]:
+        if not all(math.isfinite(v) for v in (fx, fy, fw, fh)):
+            continue               # YuNet이 가끔 inf/NaN 박스를 낸다 -> 버리면 head로 대체
         px, py = fw * FACE_PAD, fh * FACE_PAD
         out.append([cx1 + fx - px, cy1 + fy - py, cx1 + fx + fw + px, cy1 + fy + fh + py])
     return out

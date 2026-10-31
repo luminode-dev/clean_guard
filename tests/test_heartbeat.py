@@ -61,8 +61,9 @@ def main():
         check(f"system.{k}", k in sysb, str(sysb.get(k)))
     check("온도 cpu/gpu 실측", {"cpu", "gpu"} <= set(sysb["temp_c"]), str(sysb["temp_c"]))
     check("첫 회 fps는 None (기준 없음)", b["pipeline"]["fps"] is None)
-    check("정상이면 issues 비어 있음", b["issues"] == [] or b["issues"] == ["clock_unsynced"],
-          str(b["issues"]))
+    # 보드 자체 상태(시계 미동기, 실제 디스크 여유 부족)로 생기는 항목은 제외하고 본다
+    env_ok = {"clock_unsynced"} | ({"disk_low"} if (sysb.get("disk_free_mb") or 0) < 2000 else set())
+    check("정상이면 issues 비어 있음", set(b["issues"]) <= env_ok, str(b["issues"]))
 
     print("[2] fps 계산 (다음 주기)")
     t = time.monotonic()

@@ -40,7 +40,7 @@ python3 dump_monitor_jetson.py --backend trt --tts --mosaic face --reid --push -
 |---|---|
 | `--backend trt` | torch 미적재 — 상주 메모리 1185→494MB, 시작 5.0→1.4초 (보드 실측 2026-09-23). 통합 메모리라 그만큼 GPU 여유가 된다 |
 | `--push` | 주석 프레임(모자이크+박스)을 관제 서버로 SRT 송출 (720p/10fps x264). `.env`의 `SRT_HOST`/`SRT_STREAMID` 사용, 끊기면 5→30초 백오프로 무한 재연결. 서버가 안 열려 있어도 감시는 계속 돈다 |
-| `--report` | 이벤트 JSON+스냅샷을 관제 서버 API로 전송 → 대시보드 사건 목록에 표시. `.env`의 `API_URL`/`DEVICE_TOKEN`/`DEVICE_ID`/`SITE_ID` 사용. 실패 시 디스크 큐(`output/queue/events/`)에 보관 후 5초→5분 백오프로 재전송 — 회선이 끊겨도 유실 없음. 30초 하트비트·사건 전후 10초 클립·회수 보고·5초 썸네일·ROI 원격 설정이 함께 켜진다 (아래 2026-10-04 항목) |
+| `--report` | 이벤트 JSON+스냅샷을 관제 서버 API로 전송 → 대시보드 사건 목록에 표시. `.env`의 `API_URL`/`CG_DEVICE_TOKEN`(예전 이름 `DEVICE_TOKEN`도 읽음)/`DEVICE_ID`/`SITE_ID` 사용. 실패 시 디스크 큐(`output/queue/events/`)에 보관 후 5초→5분 백오프로 재전송 — 회선이 끊겨도 유실 없음. 30초 하트비트·사건 전후 5초 클립·회수 보고·5초 썸네일·ROI 원격 설정이 함께 켜진다 (아래 2026-10-04 항목) |
 | `--tts` | 투기 발화 시 현장 스피커로 한국어 경고 방송 (온디바이스 합성) |
 | `--tts-location` | 방송 문구에 장소명 삽입 ("정문 수거함 앞에 파란색 페트병을…") |
 | `--mosaic face` | 출력물의 얼굴 픽셀화. 추론은 원본으로 하므로 정확도 영향 없음 |
@@ -451,7 +451,9 @@ python3 tests/test_stream_recorder.py   # 입력 종류 판정/파일 EOF/영상
 | `STABLE_AGE` | 12 | 잔류 판정 프레임 (fps에 맞춰 조정: 대략 1초 분량) |
 | `NEAR_FACTOR` | 2.0 | 사람-객체 근접 판정 반경 |
 | `LOST_KEEP` | 300 | 재식별 보관 프레임 (긴 가림이 잦으면 늘릴 것) |
-| `CLEAR_FRAMES` | 5 | 사람 부재 확인 유예 |
+| `CLEAR_FRAMES` | 10 | 투기자 부재 + 물체 정지가 함께 이어져야 하는 프레임 (그 사이 움직이면 다시 셈) |
+| `STATIC_FRAMES` | 20 | 발화 전 제자리 정지 프레임 (10fps 기준 2초) |
+| `STATIC_MAX_FRAC` | 0.02 | 정지 허용 이동 거리 상한 (프레임 대각선 비율, 720p 약 29px). 큰 박스가 천천히 끌려가도 정지로 보지 않게 (2026-10-10 리어카 오탐) |
 
 ## 문서
 

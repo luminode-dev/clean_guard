@@ -23,8 +23,11 @@ attach()로 같은 event_id에 media 업로드만 따로 큐에 넣는다 (JSON�
 - 401(토큰 오류): 보관한 채 로그만 남기고 계속 재시도 (§3.5).
 - 400/403/413/415/422(계약 위반·용량 초과·형식 거절 — 재시도해도 똑같음): queue/events/bad/로
   치워 큐를 막지 않는다.
-- 큐 상한(기본 5,000건) 또는 디스크 여유 부족 시 가장 오래된 것부터 삭제하고
-  issues()에 "queue_full"을 올린다 (하트비트 연계용).
+- 큐 상한(기본 5,000건) 또는 디스크가 거의 찼을 때(기본 200MB 미만) 가장 오래된 것부터 삭제하고
+  issues()에 "queue_full"을 올린다 (하트비트 연계용). 이 하한은 출력물 회수 기준(--min-free-mb,
+  2000MB)과 다르다 — 같게 두면 여유 2000MB 미만 보드에서 서버가 끊길 때마다 사건이 버려진다
+  (2026-10-24, 2번 보드 여유 293MB). 디스크 확보는 OutputSpace가 출력물을 지워서 한다.
+- pending_media(): 아직 서버 확인 전인 미디어 경로 — OutputSpace가 이것은 지우지 않는다.
 
 외부 의존성 없음 (urllib). HTTPS 인증서는 시스템 CA를 쓴다.
 """
@@ -48,6 +51,7 @@ MEDIA_TYPES = {".mp4": "video/mp4", ".wav": "audio/wav", ".mp3": "audio/mpeg",
                ".jpg": "image/jpeg"}
 # 서버 확인 전엔 절대 안 지우는 파일 (announce_audio: 2026-10-05 작업 7 — WAV, 확인 후 삭제)
 VERIFY_FIELDS = ("snapshot", "snapshot_raw", "clip", "announce_audio")
+QUEUE_MIN_FREE_MB = 200.0   # 이 아래면 큐도 오래된 것부터 버린다 (디스크가 꽉 차 아무것도 못 쓰기 직전)
 DEFERRED = "deferred"       # _send_one 결과: 서버는 받았지만 미디어 확인 실패 -> 이 항목만 나중에 재시도
 
 # ---------------------------------------------------------------- ULID
@@ -110,7 +114,7 @@ class EventSender:
     """디스크 큐 + 백그라운드 재전송. 감시 루프를 절대 막지 않는다."""
 
     def __init__(self, base_url, token, device_id, site_id, queue_dir,
-                 max_queue=5000, min_free_mb=2000.0):
+                 max_queue=5000, min_free_mb=QUEUE_MIN_FREE_MB):
         self.base_url = base_url.rstrip("/")
         self.token, self.device_id, self.site_id = token, device_id, site_id
         self.queue_dir = Path(queue_dir)
@@ -183,6 +187,18 @@ class EventSender:
 
     def pending(self) -> int:
         return len(list(self.queue_dir.glob("*.json")))
+
+    def pending_media(self):
+        """큐에 남은(서버 확인 전) 미디어 파일 경로 집합 (resolve된 Path)."""
+        out = set()
+        for qfile in self.queue_dir.glob("*.json"):
+            try:
+                upload = json.loads(qfile.read_text(encoding="utf-8")).get("_upload") or {}
+            except (OSError, ValueError, AttributeError):
+                continue
+            for path in upload.values():
+                out.add(Path(path).resolve())
+        return out
 
     def issues(self):
         return ["queue_full"] if self.queue_full else []

@@ -311,6 +311,34 @@ def main():
     check("큐 유지", s.pending() == 1)
     s._stop.set(); s._wake.set(); s._th.join(2)
 
+    print("[13] 디스크 여유 부족(< 회수 기준)이어도 미전송 증거·큐는 지우지 않는다")
+    from recorder import OutputSpace
+    FakeAPI.mode = "down"
+    out = tmp / "out13"
+    out.mkdir()
+    s = make_sender(out / "queue")
+    pend = fake_file(out / "event_0001.jpg")
+    old = fake_file(out / "event_0000.jpg")                # 이미 확인돼 큐에 없는 증거 (1시간 전)
+    fresh = fake_file(out / "event_0002.wav")              # 방금 합성 — 아직 첨부 전
+    import os as _os
+    _os.utime(old, (time.time() - 3600,) * 2)
+    s.submit(sample_event(14), {"snapshot": str(pend)})
+    s.submit(sample_event(15))
+    time.sleep(0.3)
+    check("pending_media에 미전송 스냅샷", pend.resolve() in s.pending_media())
+    space = OutputSpace(out, min_free_mb=1e12, protect=s.pending_media)   # 항상 '부족'
+    space.reclaim()
+    check("회수: 확인된 증거만 삭제, 미전송분 보존", not old.exists() and pend.exists())
+    check("회수: 만든 지 10분 안 된 증거(첨부 전) 보존", fresh.exists())
+    _os.utime(pend, (0, 0))                                 # 보존 기간이 지난 것처럼
+    space.expire()
+    check("기간 삭제도 미전송분 보존", pend.exists())
+    check("여유 < 2000MB여도 큐 보존 (하한 200MB)", s.pending() == 2 and s.dropped == 0,
+          f"pending {s.pending()} dropped {s.dropped}")
+    FakeAPI.mode = "ok"
+    check("복구 후 업로드·확인 뒤 로컬 삭제", wait_until(lambda: s.pending() == 0 and not pend.exists(), 15))
+    s.close()
+
     srv.shutdown()
     print(f"\n{'실패: ' + ', '.join(fails) if fails else '전체 통과'}")
     return 1 if fails else 0
